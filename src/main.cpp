@@ -8,49 +8,59 @@
 #include "secrets.h"
 
 // ===================== 設定 =====================
-static const uint32_t BTC_UPDATE_MS   = 10 * 1000;     // 10秒
-static const uint32_t RSS_UPDATE_MS   = 60 * 1000;     // 1分
+static const uint32_t BTC_UPDATE_MS   = 10 * 1000; // 10秒
+static const uint32_t RSS_UPDATE_MS   = 60 * 1000; // 1分
 static const uint32_t WIFI_TIMEOUT_MS = 15 * 1000;
 static const uint32_t NTP_TIMEOUT_MS  = 8  * 1000;
 
-static const uint32_t TOP_UI_MS       = 250;           // 上段はゆっくり更新
-static const uint32_t TICKER_MS       = 33;            // 下段 ticker は滑らかに
+static const uint32_t TOP_UI_MS   = 250; // 上段更新
+static const uint32_t NEWS_TICK_MS= 33;  // ニューススクロール
 static const int      SCROLL_PX_PER_TICK = 2;
 
-// Bitcoin (CoinGecko: simple price)
-static const char* BTC_URL =
-  "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=jpy";
+static const char* BTC_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=jpy";
 
-// BBC RSS (primary: feeds.bbci.co.uk, fallback: newsrss.bbc.co.uk)
-static const char* RSS_WORLD_PRIMARY   = "http://feeds.bbci.co.uk/news/world/rss.xml";
-static const char* RSS_BUSINESS_PRIMARY= "http://feeds.bbci.co.uk/news/business/rss.xml";
-static const char* RSS_TECH_PRIMARY    = "http://feeds.bbci.co.uk/news/technology/rss.xml";
+// BBC 3本（あなたの「取れてた時」と同じ URL体系）
+static const char* RSS_WORLD_URL    = "https://feeds.bbci.co.uk/news/world/rss.xml";
+static const char* RSS_BUSINESS_URL = "https://feeds.bbci.co.uk/news/business/rss.xml";
+static const char* RSS_TECH_URL     = "https://feeds.bbci.co.uk/news/technology/rss.xml";
 
-static const char* RSS_WORLD_FALLBACK   = "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/world/rss.xml";
-static const char* RSS_BUSINESS_FALLBACK= "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/business/rss.xml";
-static const char* RSS_TECH_FALLBACK    = "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/technology/rss.xml";
+// バッファ（大きくしすぎると逆に危険。まずはこのくらい）
+static const size_t RSS_BUF_SZ = 520;
 
 // ===================== 共有状態（タスク間） =====================
-static SemaphoreHandle_t g_lock;
+static SemaphoreHandle_t gMutex;
 
-static double   g_btc     = 0.0;
-static double   g_btcPrev = 0.0;   // 前回値（変動率用）
-static uint32_t g_btcRev  = 0;
+static double   gBtc     = 0.0;
+static double   gBtcPrev = 0.0;
+static uint32_t gBtcRev  = 0;
 
-static String   g_world, g_business, g_tech;
-static uint32_t g_rssRev  = 0;
+static char     gWorld[RSS_BUF_SZ]    = "(pending)";
+static char     gBusiness[RSS_BUF_SZ] = "(pending)";
+static char     gTech[RSS_BUF_SZ]     = "(pending)";
+static uint32_t gRssRev  = 0;
 
-// ===================== 時刻ユーティリティ =====================
+// ===================== レイアウト（重なりゼロ） =====================
+static const int TOP_H   = 72;
+static const int NEWS_Y  = TOP_H;
+static const int NEWS_H  = 240 - TOP_H;
+
+static const uint16_t BG_TOP  = BLACK;
+static const uint16_t BG_NEWS = 0x3186; // 暗灰（黒ベタ回避）
+
+// 0行目(18px)は「RSSI専用」で毎回塗り直す → 時刻混入対策
+static const int LINE0_Y = 0;
+static const int LINE0_H = 18;
+
+static const int CLK_X = 225; // 右上に時計
+
+// ===================== 便利関数 =====================
 static bool isTimeValid() {
   time_t now = time(nullptr);
-  // 2020-09-13 以降ならNTP同期済みっぽい扱い
   return (now > 1600000000);
 }
-
 static void startNtpJST() {
   configTzTime("JST-9", "ntp.nict.jp", "pool.ntp.org", "time.google.com");
 }
-
 static String clockText() {
   if (isTimeValid()) {
     struct tm tminfo;
@@ -60,17 +70,13 @@ static String clockText() {
       return String(buf);
     }
   }
-  // 未同期はuptimeを時計っぽく
   uint32_t s = millis() / 1000;
-  uint32_t hh = (s / 3600) % 100;
-  uint32_t mm = (s / 60) % 60;
-  uint32_t ss = s % 60;
+  uint32_t hh = (s / 3600) % 100, mm = (s / 60) % 60, ss = s % 60;
   char buf[16];
   snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
            (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
   return String(buf);
 }
-
 static String dateTimeJST() {
   if (!isTimeValid()) return "----/--/-- --:--:--";
   struct tm tminfo;
@@ -79,107 +85,6 @@ static String dateTimeJST() {
   strftime(buf, sizeof(buf), "%Y/%m/%d %H:%M:%S", &tminfo);
   return String(buf);
 }
-
-// ===================== HTTP/取得 =====================
-static bool httpsGetString(const char* url, String& out) {
-  WiFiClientSecure client;
-  client.setInsecure(); // 簡易運用（CA検証したいなら差し替え）
-
-  HTTPClient http;
-  http.setTimeout(4500);
-
-  if (!http.begin(client, url)) return false;
-  int code = http.GET();
-  if (code != 200) { http.end(); return false; }
-
-  out = http.getString();
-  http.end();
-  return true;
-}
-
-static bool fetchBtcOnce(double& outBtc) {
-  String body;
-  if (!httpsGetString(BTC_URL, body)) return false;
-
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, body)) return false;
-
-  double v = doc["bitcoin"]["jpy"] | 0.0;
-  if (v <= 0.0) return false;
-
-  outBtc = v;
-  return true;
-}
-
-// RSSから <item> 内 <title> を拾う（超軽量パース）
-static bool fetchRssTitlesFrom(const char* url, String& joined, int maxItems = 6) {
-  String xml;
-  if (!httpsGetString(url, xml)) return false;
-
-  joined = "";
-  int count = 0;
-  int pos = 0;
-
-  while (count < maxItems) {
-    int itemS = xml.indexOf("<item", pos);
-    if (itemS < 0) break;
-    int itemE = xml.indexOf("</item>", itemS);
-    if (itemE < 0) break;
-
-    String item = xml.substring(itemS, itemE);
-
-    int tS = item.indexOf("<title>");
-    int tE = item.indexOf("</title>");
-    if (tS >= 0 && tE > tS) {
-      String title = item.substring(tS + 7, tE);
-      title.replace("<![CDATA[", "");
-      title.replace("]]>", "");
-      title.replace("&amp;", "&");
-      title.replace("&lt;", "<");
-      title.replace("&gt;", ">");
-      title.replace("&quot;", "\"");
-      title.replace("&#39;", "'");
-
-      if (joined.length()) joined += "  |  ";
-      joined += title;
-      count++;
-    }
-    pos = itemE + 7;
-  }
-
-  return (count > 0);
-}
-
-static bool fetchRssWithFallback(const char* primary, const char* fallback, String& outJoined) {
-  if (fetchRssTitlesFrom(primary, outJoined)) return true;
-  return fetchRssTitlesFrom(fallback, outJoined);
-}
-
-// ===================== UI（差分描画） =====================
-struct UiCache {
-  char timeLine[16] = "";
-  char wifiLine[32] = "";
-  uint16_t wifiFg = 0xFFFF;
-
-  char jstLine[32] = "";
-  char btcLine[32] = "";
-  uint16_t btcBorder = 0xFFFF;
-
-  int tickerX = 0;
-  int tickerTotalW = 0;
-
-  uint32_t lastRssRev = 0;
-  uint32_t lastBtcRev = 0;
-};
-static UiCache ui;
-
-static const int TOP_H   = 72;
-static const int NEWS_Y  = TOP_H;
-static const int NEWS_H  = 240 - TOP_H;
-
-static const uint16_t BG_TOP   = BLACK;
-static const uint16_t BG_NEWS  = 0x2104; // かなり暗いグレー（黒ベタ感を弱める）
-static const uint16_t FG_LABEL = WHITE;
 
 static uint16_t lerp565(uint8_t r0, uint8_t g0, uint8_t b0,
                         uint8_t r1, uint8_t g1, uint8_t b1,
@@ -192,255 +97,410 @@ static uint16_t lerp565(uint8_t r0, uint8_t g0, uint8_t b0,
   uint8_t b = (uint8_t)(b0 + (b1 - b0) * t);
   return M5.Display.color565(r, g, b);
 }
-
 static uint16_t btcBorderColorFromChange(double prev, double now) {
   if (prev <= 0.0 || now <= 0.0) return WHITE;
-
-  double ch = (now - prev) / prev;      // 変動率
+  double ch = (now - prev) / prev;
   double mag = fabs(ch);
-
-  // 0.5%で最大発色（好みで調整）
-  float t = (float)(mag / 0.005);
+  float t = (float)(mag / 0.005); // 0.5%で最大
   if (t > 1.0f) t = 1.0f;
-
-  // ベースは暗め、上げ=緑、下げ=赤
-  if (ch >= 0.0) return lerp565(40, 40, 40, 0, 255, 0, t);
-  else           return lerp565(40, 40, 40, 255, 0, 0, t);
+  return (ch >= 0.0) ? lerp565(30,30,30, 0,255,0, t) : lerp565(30,30,30, 255,0,0, t);
 }
 
-static bool drawTextIfChanged(int x, int y, int w, int h,
-                              uint16_t bg, uint16_t fg, int size,
-                              const char* text, char* cache, size_t cacheN,
-                              bool force = false)
-{
-  if (!force && text && cache && strcmp(text, cache) == 0) return false;
+// よく出るUnicode記号をASCII寄せ（BBCでも “ ” – … が混ざる）
+static void sanitizeUtf8ToAscii(String& s) {
+  String out; out.reserve(s.length());
+  auto match3 = [&](size_t i, uint8_t a, uint8_t b, uint8_t c) -> bool {
+    return (i + 2 < s.length() &&
+            (uint8_t)s[i] == a && (uint8_t)s[i+1] == b && (uint8_t)s[i+2] == c);
+  };
+  auto match2 = [&](size_t i, uint8_t a, uint8_t b) -> bool {
+    return (i + 1 < s.length() && (uint8_t)s[i] == a && (uint8_t)s[i+1] == b);
+  };
+  for (size_t i = 0; i < s.length(); ) {
+    uint8_t c = (uint8_t)s[i];
+    if (c < 0x80) { out += (char)c; i++; continue; }
+    if (match2(i, 0xC2, 0xA0)) { out += ' '; i += 2; continue; } // NBSP
+    if (match3(i, 0xE2, 0x80, 0x98) || match3(i, 0xE2, 0x80, 0x99)) { out += '\''; i += 3; continue; }
+    if (match3(i, 0xE2, 0x80, 0x9C) || match3(i, 0xE2, 0x80, 0x9D)) { out += '"';  i += 3; continue; }
+    if (match3(i, 0xE2, 0x80, 0x93) || match3(i, 0xE2, 0x80, 0x94)) { out += '-';  i += 3; continue; }
+    if (match3(i, 0xE2, 0x80, 0xA6)) { out += "..."; i += 3; continue; }
+    int len = 1;
+    if      ((c & 0xE0) == 0xC0) len = 2;
+    else if ((c & 0xF0) == 0xE0) len = 3;
+    else if ((c & 0xF8) == 0xF0) len = 4;
+    i += len;
+    out += '?';
+  }
+  s = out;
+}
 
-  M5.Display.fillRect(x, y, w, h, bg);
-  M5.Display.setTextColor(fg, bg);
-  M5.Display.setTextSize(size);
-  M5.Display.setCursor(x, y);
-  M5.Display.print(text ? text : "");
-
-  snprintf(cache, cacheN, "%s", text ? text : "");
+// ===================== HTTP（BBCに強い設定：UA + identity） =====================
+static bool httpsGetStream(const char* url, HTTPClient& http, WiFiClientSecure& client) {
+  client.setInsecure();
+  http.setTimeout(4500);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setUserAgent("Mozilla/5.0 (M5Stack; ESP32) RSSClient/1.0");
+  http.useHTTP10(true);                 // ← chunked絡みの事故を減らす
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("Accept", "*/*");
+  http.addHeader("Connection", "close");
   return true;
+}
+
+// ===================== RSS：ストリーム解析（XML丸ごと保持しない） =====================
+static void decodeEntities(String& s) {
+  s.replace("&amp;", "&");
+  s.replace("&lt;", "<");
+  s.replace("&gt;", ">");
+  s.replace("&quot;", "\"");
+  s.replace("&apos;", "'");
+  s.replace("&#39;", "'");
+}
+
+static bool fetchRssTitlesStreamToBuf(const char* url, char* dst, size_t dstsz, int maxItems = 4) {
+  if (!dst || dstsz == 0) return false;
+  dst[0] = '\0';
+
+  WiFiClientSecure client;
+  HTTPClient http;
+
+  if (!httpsGetStream(url, http, client)) return false;
+
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+
+  WiFiClient* s = http.getStreamPtr();
+  if (!s) { http.end(); return false; }
+
+  // パターンマッチ
+  const char* P_ITEM_S  = "<item";
+  const char* P_ITEM_E  = "</item>";
+  const char* P_TIT_S   = "<title>";
+  const char* P_TIT_E   = "</title>";
+
+  int miS=0, miE=0, mtS=0, mtE=0;
+  bool inItem=false, inTitle=false;
+  String title; title.reserve(180);
+  String joined; joined.reserve(dstsz-1);
+  int count=0;
+
+  // inTitle中に "</title>" の判定をするための小バッファ
+  String endbuf; endbuf.reserve(10);
+  bool checkingEnd=false;
+
+  while (s->connected() && s->available()) {
+    char c = (char)s->read();
+
+    // item開始/終了判定（title中でも動くが実害なし）
+    miS = (c == P_ITEM_S[miS]) ? (miS+1) : (c == P_ITEM_S[0] ? 1 : 0);
+    if (P_ITEM_S[miS] == '\0') { inItem = true; miS = 0; }
+
+    miE = (c == P_ITEM_E[miE]) ? (miE+1) : (c == P_ITEM_E[0] ? 1 : 0);
+    if (P_ITEM_E[miE] == '\0') { inItem = false; miE = 0; }
+
+    // title開始判定（item内だけ）
+    if (!inTitle && inItem) {
+      mtS = (c == P_TIT_S[mtS]) ? (mtS+1) : (c == P_TIT_S[0] ? 1 : 0);
+      if (P_TIT_S[mtS] == '\0') {
+        inTitle = true;
+        title = "";
+        checkingEnd = false;
+        endbuf = "";
+        mtS = 0;
+        continue; // "<title>" の '>' は本文に入れない
+      }
+    }
+
+    if (inTitle) {
+      // 終端タグ検出（途中で '<' が来たら終端候補扱い）
+      if (!checkingEnd) {
+        if (c == '<') {
+          checkingEnd = true;
+          endbuf = "<";
+          mtE = 1;
+          continue;
+        } else {
+          if (title.length() < 220) title += c;
+          continue;
+        }
+      } else {
+        // 終端候補の検証
+        const char* pat = P_TIT_E;
+        if (c == pat[mtE]) {
+          endbuf += c;
+          mtE++;
+          if (pat[mtE] == '\0') {
+            // </title> 完了
+            inTitle = false;
+            checkingEnd = false;
+            mtE = 0;
+            // 整形して追加
+            decodeEntities(title);
+            sanitizeUtf8ToAscii(title);
+            title.trim();
+
+            if (title.length()) {
+              if (joined.length()) joined += "  |  ";
+              joined += title;
+              count++;
+            }
+            if (count >= maxItems) break;
+            continue;
+          }
+          continue;
+        } else {
+          // 終端じゃなかった → endbufを本文に戻す
+          checkingEnd = false;
+          mtE = 0;
+          if (title.length() + endbuf.length() < 240) title += endbuf;
+          // 現在の文字も本文へ
+          if (title.length() < 240) title += c;
+          continue;
+        }
+      }
+    }
+  }
+
+  http.end();
+
+  if (count <= 0) return false;
+  sanitizeUtf8ToAscii(joined);
+  snprintf(dst, dstsz, "%s", joined.c_str());
+  return true;
+}
+
+// ===================== BTC =====================
+static bool fetchBtc(double& outBtc) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(4500);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setUserAgent("Mozilla/5.0 (M5Stack; ESP32) RSSClient/1.0");
+  if (!http.begin(client, BTC_URL)) return false;
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String body = http.getString();
+  http.end();
+
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, body)) return false;
+
+  double v = doc["bitcoin"]["jpy"] | 0.0;
+  if (v <= 0.0) return false;
+  outBtc = v;
+  return true;
+}
+
+// ===================== UI：ニュース4段（スプライト1枚使い回し） =====================
+static M5Canvas newsSpr(&M5.Display); // 320x40 1枚のみ
+
+struct NewsLine {
+  String text;
+  int x = 320;
+  int w = 0;
+  uint16_t color = WHITE;
+};
+static NewsLine lines[4];
+static uint32_t lastSeenRssRev = 0;
+
+static String firstItem(const char* s) {
+  if (!s) return "";
+  String ss = String(s);
+  int p = ss.indexOf("  |  ");
+  if (p < 0) return ss;
+  return ss.substring(0, p);
+}
+
+static void rebuild4LinesIfNeeded() {
+  uint32_t rev;
+  char wbuf[RSS_BUF_SZ], bbuf[RSS_BUF_SZ], tbuf[RSS_BUF_SZ];
+
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  rev = gRssRev;
+  snprintf(wbuf, sizeof(wbuf), "%s", gWorld);
+  snprintf(bbuf, sizeof(bbuf), "%s", gBusiness);
+  snprintf(tbuf, sizeof(tbuf), "%s", gTech);
+  xSemaphoreGive(gMutex);
+
+  if (rev == lastSeenRssRev) return;
+  lastSeenRssRev = rev;
+
+  lines[0].text = String("WORLD: ") + wbuf;
+  lines[1].text = String("BUSINESS: ") + bbuf;
+  lines[2].text = String("TECH: ") + tbuf;
+  lines[3].text = String("MIX: ") + firstItem(wbuf) + "  |  " + firstItem(bbuf) + "  |  " + firstItem(tbuf);
+
+  lines[0].color = CYAN;
+  lines[1].color = ORANGE;
+  lines[2].color = MAGENTA;
+  lines[3].color = WHITE;
+
+  newsSpr.setTextSize(3);
+  for (int i=0;i<4;i++){
+    lines[i].w = newsSpr.textWidth(lines[i].text.c_str());
+    if (lines[i].w < 1) lines[i].w = lines[i].text.length() * 18;
+    lines[i].x = M5.Display.width();
+  }
 }
 
 static void drawStaticUI() {
   M5.Display.fillScreen(BG_TOP);
-
-  // 上段背景
-  M5.Display.fillRect(0, 0, 320, TOP_H, BG_TOP);
-
-  // 下段背景（黒ベタをやめる）
   M5.Display.fillRect(0, NEWS_Y, 320, NEWS_H, BG_NEWS);
-  M5.Display.drawRect(0, NEWS_Y, 320, NEWS_H, 0x7BEF); // 薄い枠
+  M5.Display.drawFastHLine(0, TOP_H-1, 320, 0x7BEF);
 
-  // ラベル
+  // 上段ラベル
+  M5.Display.setTextColor(WHITE, BG_TOP);
   M5.Display.setTextSize(2);
-  M5.Display.setTextColor(FG_LABEL, BG_TOP);
-
-  M5.Display.setCursor(0, 0);
-  M5.Display.print("WiFi:");
-
-  M5.Display.setCursor(0, 22);
-  M5.Display.print("JST :");
-
-  // BTCパネル枠（中身は動的）
-  M5.Display.drawRoundRect(0, 44, 320, 26, 6, WHITE);
-
-  // 区切り線
-  M5.Display.drawFastHLine(0, TOP_H - 1, 320, 0x7BEF);
-}
-
-// ticker 描画用 sprite
-static M5Canvas tickerSpr(&M5.Display);
-
-static void tickerRecalcTotalWidth(const String& w, const String& b, const String& t) {
-  tickerSpr.setTextSize(3);
-  String plain;
-  plain.reserve(512);
-  plain += "WORLD: ";    plain += (w.length() ? w : "(no data)");
-  plain += "   |   ";
-  plain += "BUSINESS: "; plain += (b.length() ? b : "(no data)");
-  plain += "   |   ";
-  plain += "TECH: ";     plain += (t.length() ? t : "(no data)");
-  ui.tickerTotalW = tickerSpr.textWidth(plain.c_str());
-  ui.tickerX = M5.Display.width();
-}
-
-static void drawTicker(const String& w, const String& b, const String& t) {
-  const int tickerH = 70;
-  const int y = NEWS_Y + (NEWS_H - tickerH) / 2;
-
-  tickerSpr.fillSprite(BG_NEWS);
-  tickerSpr.setTextSize(3);
-  tickerSpr.setCursor(ui.tickerX, 18);
-
-  // 色（カテゴリごと）
-  const uint16_t C_WORLD = CYAN;
-  const uint16_t C_BUS   = ORANGE;
-  const uint16_t C_TECH  = MAGENTA;
-  const uint16_t C_SEP   = 0xCE59; // 明るいグレー
-
-  auto seg = [&](uint16_t col, const char* label, const String& body) {
-    tickerSpr.setTextColor(col, BG_NEWS);
-    tickerSpr.print(label);
-    tickerSpr.print(": ");
-    tickerSpr.print(body.length() ? body : String("(no data)"));
-  };
-
-  seg(C_WORLD, "WORLD", w);
-  tickerSpr.setTextColor(C_SEP, BG_NEWS);
-  tickerSpr.print("   |   ");
-  seg(C_BUS, "BUSINESS", b);
-  tickerSpr.setTextColor(C_SEP, BG_NEWS);
-  tickerSpr.print("   |   ");
-  seg(C_TECH, "TECH", t);
-
-  tickerSpr.pushSprite(0, y);
-
-  // スクロール
-  ui.tickerX -= SCROLL_PX_PER_TICK;
-  if (ui.tickerX < -ui.tickerTotalW) {
-    ui.tickerX = M5.Display.width();
-  }
+  M5.Display.setCursor(0, 22); M5.Display.print("JST :");
+  // BTC枠だけは静的枠を描かず、毎回描画側で描く（枠色が変わるため）
 }
 
 static void drawTopDynamic() {
-  // WiFi状態 / RSSI / 時計 / JST / BTC を必要箇所だけ更新
+  // 0行目は毎回塗り直す（RSSIに時計が混ざる問題を根絶）
+  M5.Display.fillRect(0, LINE0_Y, 320, LINE0_H, BG_TOP);
+
   const bool wifiOk = (WiFi.status() == WL_CONNECTED);
-  const int rssi = wifiOk ? WiFi.RSSI() : 0;
+  int rssi = wifiOk ? WiFi.RSSI() : 0;
 
-  // 時計（左上の空きに大きめで）
-  String clk = clockText();
-  drawTextIfChanged(110, 0, 210, 18, BG_TOP, WHITE, 2, clk.c_str(), ui.timeLine, sizeof(ui.timeLine));
+  // RSSI表示（左側固定）
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(wifiOk ? GREEN : RED, BG_TOP);
+  M5.Display.setCursor(0, 0);
+  if (wifiOk) M5.Display.printf("WiFi OK RSSI:%ddBm", rssi);
+  else        M5.Display.print("WiFi NG RSSI:--");
 
-  // WiFi line (色付き)
-  char wbuf[32];
-  if (wifiOk) snprintf(wbuf, sizeof(wbuf), "OK  RSSI:%ddBm", rssi);
-  else        snprintf(wbuf, sizeof(wbuf), "NG  RSSI:--");
+  // 時計（右上固定）
+  M5.Display.setTextColor(WHITE, BG_TOP);
+  M5.Display.setCursor(CLK_X, 0);
+  M5.Display.print(clockText());
 
-  uint16_t wfg = wifiOk ? GREEN : RED;
-  bool wifiForce = (ui.wifiFg != wfg);
-  ui.wifiFg = wfg;
+  // JST
+  M5.Display.fillRect(70, 22, 250, 18, BG_TOP);
+  M5.Display.setCursor(70, 22);
+  M5.Display.setTextColor(WHITE, BG_TOP);
+  M5.Display.print(dateTimeJST());
 
-  drawTextIfChanged(70, 0, 240, 18, BG_TOP, wfg, 2, wbuf, ui.wifiLine, sizeof(ui.wifiLine), wifiForce);
-
-  // JST datetime
-  String dt = dateTimeJST();
-  drawTextIfChanged(70, 22, 250, 18, BG_TOP, WHITE, 2, dt.c_str(), ui.jstLine, sizeof(ui.jstLine));
-
-  // BTC panel
+  // BTC（黄色文字＋枠色）
   double btc, prev;
-  uint32_t btcRev;
-  xSemaphoreTake(g_lock, portMAX_DELAY);
-  btc = g_btc;
-  prev = g_btcPrev;
-  btcRev = g_btcRev;
-  xSemaphoreGive(g_lock);
+  uint32_t rev;
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  btc = gBtc; prev = gBtcPrev; rev = gBtcRev;
+  xSemaphoreGive(gMutex);
 
-  // 表示文字
-  char bbuf[32];
+  char bline[48];
   if (btc > 0.0 && prev > 0.0) {
     double ch = (btc - prev) / prev * 100.0;
-    snprintf(bbuf, sizeof(bbuf), "BTC/JPY %.0f  (%+.2f%%)", btc, ch);
+    snprintf(bline, sizeof(bline), "BTC/JPY %.0f  (%+.2f%%)", btc, ch);
   } else if (btc > 0.0) {
-    snprintf(bbuf, sizeof(bbuf), "BTC/JPY %.0f", btc);
+    snprintf(bline, sizeof(bline), "BTC/JPY %.0f", btc);
   } else {
-    snprintf(bbuf, sizeof(bbuf), "BTC/JPY (pending)");
+    snprintf(bline, sizeof(bline), "BTC/JPY (pending)");
   }
 
   uint16_t border = btcBorderColorFromChange(prev, btc);
-  bool btcForce = (ui.btcBorder != border) || (ui.lastBtcRev != btcRev);
-  ui.btcBorder = border;
-  ui.lastBtcRev = btcRev;
+  // BTC領域描画
+  M5.Display.fillRect(0, 44, 320, 26, BG_TOP);
+  M5.Display.drawRoundRect(0, 44, 320, 26, 6, border);
+  M5.Display.setTextColor(YELLOW, BG_TOP);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(8, 48);
+  M5.Display.print(bline);
 
-  if (btcForce || strcmp(bbuf, ui.btcLine) != 0) {
-    // 枠
-    M5.Display.fillRect(0, 44, 320, 26, BG_TOP);
-    M5.Display.drawRoundRect(0, 44, 320, 26, 6, border);
+  (void)rev;
+}
 
-    // 文字（黄色）
-    M5.Display.setTextColor(YELLOW, BG_TOP);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(8, 48);
-    M5.Display.print(bbuf);
+static void drawNews4Lines() {
+  const int lineH = 40;
+  const int startY = NEWS_Y + 4;
 
-    snprintf(ui.btcLine, sizeof(ui.btcLine), "%s", bbuf);
+  newsSpr.setTextWrap(false);
+  newsSpr.setTextSize(3);
+
+  for (int i=0;i<4;i++){
+    newsSpr.fillSprite(BG_NEWS);
+    newsSpr.setTextColor(lines[i].color, BG_NEWS);
+    newsSpr.setCursor(lines[i].x, 8);
+    newsSpr.print(lines[i].text);
+
+    newsSpr.pushSprite(0, startY + i*lineH);
+
+    lines[i].x -= SCROLL_PX_PER_TICK;
+    if (lines[i].x < -lines[i].w) lines[i].x = M5.Display.width();
   }
 }
 
 // ===================== タスク =====================
-static void TaskNet(void* arg) {
+static void NetTask(void* arg){
   (void)arg;
-
-  uint32_t wifiStart = millis();
-  uint32_t ntpStart = 0;
-  bool ntpStarted = false;
-
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
+  uint32_t wifiStart = millis();
+  uint32_t ntpStart  = 0;
+  bool ntpStarted = false;
+
   uint32_t lastBtc = 0;
   uint32_t lastRss = 0;
 
-  for (;;) {
+  for(;;){
     uint32_t now = millis();
 
-    // WiFi接続管理
     if (WiFi.status() != WL_CONNECTED) {
-      if (now - wifiStart > WIFI_TIMEOUT_MS) {
-        // 定期的に再トライ
-        if (now - wifiStart > 10000) {
-          WiFi.disconnect(true, true);
-          WiFi.begin(WIFI_SSID, WIFI_PASS);
-          wifiStart = now;
-        }
+      if (now - wifiStart > WIFI_TIMEOUT_MS && now - wifiStart > 10000) {
+        WiFi.disconnect(true, true);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        wifiStart = now;
       }
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
-    // NTP開始
+    // NTP
     if (!isTimeValid() && !ntpStarted) {
       startNtpJST();
       ntpStart = now;
       ntpStarted = true;
     }
     if (ntpStarted && !isTimeValid() && (now - ntpStart > NTP_TIMEOUT_MS)) {
-      // 諦めても動かす（uptime時計のまま）
-      ntpStarted = false;
+      ntpStarted = false; // 諦めても動かす
     }
     if (isTimeValid()) ntpStarted = false;
 
     // BTC
     if (now - lastBtc >= BTC_UPDATE_MS) {
       double v;
-      if (fetchBtcOnce(v)) {
-        xSemaphoreTake(g_lock, portMAX_DELAY);
-        g_btcPrev = (g_btc > 0.0) ? g_btc : v; // 初回はprev=now
-        g_btc = v;
-        g_btcRev++;
-        xSemaphoreGive(g_lock);
+      if (fetchBtc(v)) {
+        xSemaphoreTake(gMutex, portMAX_DELAY);
+        gBtcPrev = (gBtc > 0.0) ? gBtc : v;
+        gBtc = v;
+        gBtcRev++;
+        xSemaphoreGive(gMutex);
       }
       lastBtc = now;
     }
 
-    // RSS（3本）
+    // RSS（BBC 3本）
     if (now - lastRss >= RSS_UPDATE_MS) {
-      String w, b, t;
+      char buf[RSS_BUF_SZ];
 
-      bool okW = fetchRssWithFallback(RSS_WORLD_PRIMARY,    RSS_WORLD_FALLBACK,    w);
-      bool okB = fetchRssWithFallback(RSS_BUSINESS_PRIMARY, RSS_BUSINESS_FALLBACK, b);
-      bool okT = fetchRssWithFallback(RSS_TECH_PRIMARY,     RSS_TECH_FALLBACK,     t);
+      bool okW = fetchRssTitlesStreamToBuf(RSS_WORLD_URL, buf, sizeof(buf), 4);
+      xSemaphoreTake(gMutex, portMAX_DELAY);
+      snprintf(gWorld, sizeof(gWorld), "%s", okW ? buf : "(WORLD failed)");
+      xSemaphoreGive(gMutex);
 
-      xSemaphoreTake(g_lock, portMAX_DELAY);
-      g_world    = okW ? w : String("(world fetch failed)");
-      g_business = okB ? b : String("(business fetch failed)");
-      g_tech     = okT ? t : String("(tech fetch failed)");
-      g_rssRev++;
-      xSemaphoreGive(g_lock);
+      bool okB = fetchRssTitlesStreamToBuf(RSS_BUSINESS_URL, buf, sizeof(buf), 4);
+      xSemaphoreTake(gMutex, portMAX_DELAY);
+      snprintf(gBusiness, sizeof(gBusiness), "%s", okB ? buf : "(BUSINESS failed)");
+      xSemaphoreGive(gMutex);
+
+      bool okT = fetchRssTitlesStreamToBuf(RSS_TECH_URL, buf, sizeof(buf), 4);
+      xSemaphoreTake(gMutex, portMAX_DELAY);
+      snprintf(gTech, sizeof(gTech), "%s", okT ? buf : "(TECH failed)");
+      gRssRev++;
+      xSemaphoreGive(gMutex);
 
       lastRss = now;
     }
@@ -449,86 +509,59 @@ static void TaskNet(void* arg) {
   }
 }
 
-static void TaskUi(void* arg) {
+static void UiTask(void* arg){
   (void)arg;
 
-  // ticker sprite 初期化
-  tickerSpr.createSprite(320, 70);
-  tickerSpr.setTextWrap(false);
+  // ニューススプライトは「1枚だけ」
+  newsSpr.createSprite(320, 40);
 
   drawStaticUI();
 
   uint32_t lastTop = 0;
-  uint32_t lastTick = 0;
+  uint32_t lastNews= 0;
 
-  // ticker初期幅
-  {
-    String w, b, t;
-    uint32_t rev;
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    w = g_world; b = g_business; t = g_tech; rev = g_rssRev;
-    xSemaphoreGive(g_lock);
-    ui.lastRssRev = rev;
-    tickerRecalcTotalWidth(w, b, t);
-  }
-
-  for (;;) {
+  for(;;){
     uint32_t now = millis();
 
-    // 上段（必要な矩形だけ更新）
     if (now - lastTop >= TOP_UI_MS) {
       drawTopDynamic();
       lastTop = now;
     }
 
-    // 下段 ticker（ここだけは毎フレーム描き直す）
-    if (now - lastTick >= TICKER_MS) {
-      String w, b, t;
-      uint32_t rev;
-      xSemaphoreTake(g_lock, portMAX_DELAY);
-      w = g_world; b = g_business; t = g_tech; rev = g_rssRev;
-      xSemaphoreGive(g_lock);
-
-      if (rev != ui.lastRssRev) {
-        ui.lastRssRev = rev;
-        tickerRecalcTotalWidth(w, b, t);
-      }
-
-      drawTicker(w, b, t);
-      lastTick = now;
+    if (now - lastNews >= NEWS_TICK_MS) {
+      rebuild4LinesIfNeeded();
+      drawNews4Lines();
+      lastNews = now;
     }
 
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
-// ===================== setup / loop =====================
-void setup() {
+void setup(){
+  Serial.begin(115200);
   auto cfg = M5.config();
   M5.begin(cfg);
 
+  M5.Speaker.end();
   M5.Display.setBrightness(255);
+  M5.Display.setRotation(1);
   M5.Display.setTextColor(WHITE, BLACK);
 
-  g_lock = xSemaphoreCreateMutex();
+  gMutex = xSemaphoreCreateMutex();
 
-  // 初期ダミー値
-  xSemaphoreTake(g_lock, portMAX_DELAY);
-  g_world = "(fetching...)";
-  g_business = "(fetching...)";
-  g_tech = "(fetching...)";
-  xSemaphoreGive(g_lock);
+  // 初期値
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  snprintf(gWorld, sizeof(gWorld), "%s", "(fetching...)");
+  snprintf(gBusiness, sizeof(gBusiness), "%s", "(fetching...)");
+  snprintf(gTech, sizeof(gTech), "%s", "(fetching...)");
+  gRssRev++;
+  xSemaphoreGive(gMutex);
 
-  // タスク起動（NetはCore0、UIはCore1）
-  xTaskCreatePinnedToCore(TaskNet, "net", 8192, nullptr, 1, nullptr, 0);
-  xTaskCreatePinnedToCore(TaskUi,  "ui",  8192, nullptr, 2, nullptr, 1);
+  // UI=Core1、NET=Core0
+  xTaskCreatePinnedToCore(UiTask,  "UiTask",  8192, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(NetTask, "NetTask", 8192, nullptr, 1, nullptr, 0);
 
-  // 仕様どおり loop は使わず、setup常駐
-  for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
+  for(;;) delay(1000);
 }
-
-void loop() {
-  // 仕様どおり未使用
-}
+void loop(){}
