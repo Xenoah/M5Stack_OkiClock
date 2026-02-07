@@ -7,69 +7,52 @@
 
 #include "secrets.h"
 
-// ==== 設定 ====
-static const uint32_t BTC_UPDATE_MS = 60 * 1000;
-static const uint32_t RSS_UPDATE_MS = 5 * 60 * 1000;
+// ===================== 設定 =====================
+static const uint32_t BTC_UPDATE_MS   = 10 * 1000;     // 10秒
+static const uint32_t RSS_UPDATE_MS   = 60 * 1000;     // 1分
+static const uint32_t WIFI_TIMEOUT_MS = 15 * 1000;
+static const uint32_t NTP_TIMEOUT_MS  = 8  * 1000;
 
-static const uint32_t UI_TICK_MS    = 33;     // UI更新周期（約30fps）
-static const int      SCROLL_PX_PER_TICK = 2; // ティッカー速度
+static const uint32_t TOP_UI_MS       = 250;           // 上段はゆっくり更新
+static const uint32_t TICKER_MS       = 33;            // 下段 ticker は滑らかに
+static const int      SCROLL_PX_PER_TICK = 2;
 
-static const uint32_t WIFI_TIMEOUT_MS = 15000;
-static const uint32_t NTP_TIMEOUT_MS  = 8000;
+// Bitcoin (CoinGecko: simple price)
+static const char* BTC_URL =
+  "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=jpy";
 
-// テキストバッファサイズ（必要なら増やしてOK）
-static const size_t RSS_BUF_SZ    = 512;
-static const size_t TICKER_BUF_SZ = 768;
+// BBC RSS (primary: feeds.bbci.co.uk, fallback: newsrss.bbc.co.uk)
+static const char* RSS_WORLD_PRIMARY   = "http://feeds.bbci.co.uk/news/world/rss.xml";
+static const char* RSS_BUSINESS_PRIMARY= "http://feeds.bbci.co.uk/news/business/rss.xml";
+static const char* RSS_TECH_PRIMARY    = "http://feeds.bbci.co.uk/news/technology/rss.xml";
 
-// ==== 共有状態（タスク間） ====
-static SemaphoreHandle_t gMutex;
+static const char* RSS_WORLD_FALLBACK   = "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/world/rss.xml";
+static const char* RSS_BUSINESS_FALLBACK= "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/business/rss.xml";
+static const char* RSS_TECH_FALLBACK    = "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/technology/rss.xml";
 
-static volatile int  gWiFiStatus = WL_DISCONNECTED;
-static volatile bool gTimeValid  = false;
-static double        gBtcJpy     = 0.0;
+// ===================== 共有状態（タスク間） =====================
+static SemaphoreHandle_t g_lock;
 
-static char gRssTitles[RSS_BUF_SZ]   = "(pending)";
-static char gPhase[32]               = "WiFi connecting"; // 起動フェーズ表示
+static double   g_btc     = 0.0;
+static double   g_btcPrev = 0.0;   // 前回値（変動率用）
+static uint32_t g_btcRev  = 0;
 
-// dirtyフラグ（UI側が差分描画するため）
-static volatile bool gDirtyStatus = true;  // WiFi/Time/BTC/RSS状態
-static volatile bool gDirtyTicker = true;  // ティッカー文章
+static String   g_world, g_business, g_tech;
+static uint32_t g_rssRev  = 0;
 
-enum InitState { INIT_WIFI, INIT_NTP, INIT_FETCH, RUNNING, OFFLINE };
-static volatile InitState gState = INIT_WIFI;
-
-// ==== UI（スプライトでティッカーを滑らかに） ====
-static M5Canvas tickerCanvas(&M5.Display);
-static bool tickerSpriteOK = false;
-static int  tickerX = 0;
-
-// UIキャッシュ（差分描画）
-struct UiCache {
-  char phase[32]  = "";
-  char clock[16]  = "";
-  char wifi[8]    = "";
-  char timeMode[8]= "";
-  char btc[16]    = "";
-  char rss[16]    = "";
-  char jstline[32]= "";
-};
-static UiCache uiBoot, uiRun;
-
-static bool isTimeValidLocal() {
+// ===================== 時刻ユーティリティ =====================
+static bool isTimeValid() {
   time_t now = time(nullptr);
-  return (now > 1600000000); // だいたい2020年以降なら同期済み扱い
+  // 2020-09-13 以降ならNTP同期済みっぽい扱い
+  return (now > 1600000000);
 }
 
-static void updateTimeValidFlag() {
-  bool v = isTimeValidLocal();
-  if (v != gTimeValid) {
-    gTimeValid = v;
-    gDirtyStatus = true;
-  }
+static void startNtpJST() {
+  configTzTime("JST-9", "ntp.nict.jp", "pool.ntp.org", "time.google.com");
 }
 
 static String clockText() {
-  if (isTimeValidLocal()) {
+  if (isTimeValid()) {
     struct tm tminfo;
     if (getLocalTime(&tminfo, 0)) {
       char buf[16];
@@ -77,7 +60,7 @@ static String clockText() {
       return String(buf);
     }
   }
-  // 未同期: uptimeを時計っぽく
+  // 未同期はuptimeを時計っぽく
   uint32_t s = millis() / 1000;
   uint32_t hh = (s / 3600) % 100;
   uint32_t mm = (s / 60) % 60;
@@ -89,7 +72,7 @@ static String clockText() {
 }
 
 static String dateTimeJST() {
-  if (!isTimeValidLocal()) return "----/--/-- --:--:--";
+  if (!isTimeValid()) return "----/--/-- --:--:--";
   struct tm tminfo;
   if (!getLocalTime(&tminfo, 0)) return "----/--/-- --:--:--";
   char buf[32];
@@ -97,38 +80,24 @@ static String dateTimeJST() {
   return String(buf);
 }
 
-static void setPhase(const char* p) {
-  xSemaphoreTake(gMutex, portMAX_DELAY);
-  snprintf(gPhase, sizeof(gPhase), "%s", p ? p : "");
-  xSemaphoreGive(gMutex);
-  gDirtyStatus = true;
-}
-
-static void startWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-}
-
-static void startNtpJST() {
-  configTzTime("JST-9", "ntp.nict.jp", "pool.ntp.org", "time.google.com");
-}
-
+// ===================== HTTP/取得 =====================
 static bool httpsGetString(const char* url, String& out) {
   WiFiClientSecure client;
-  client.setInsecure(); // まず動かす版（後でCA検証に差し替え可）
+  client.setInsecure(); // 簡易運用（CA検証したいなら差し替え）
 
   HTTPClient http;
-  http.setTimeout(3500);
+  http.setTimeout(4500);
 
   if (!http.begin(client, url)) return false;
   int code = http.GET();
   if (code != 200) { http.end(); return false; }
+
   out = http.getString();
   http.end();
   return true;
 }
 
-static bool fetchBtc(double& outBtc) {
+static bool fetchBtcOnce(double& outBtc) {
   String body;
   if (!httpsGetString(BTC_URL, body)) return false;
 
@@ -137,20 +106,17 @@ static bool fetchBtc(double& outBtc) {
 
   double v = doc["bitcoin"]["jpy"] | 0.0;
   if (v <= 0.0) return false;
+
   outBtc = v;
   return true;
 }
 
-// RSSから <item><title> を拾う（ネット側でだけString使用）
-static bool fetchRssTitlesToBuf(char* dst, size_t dstsz, int maxItems = 5) {
-  if (!dst || dstsz == 0) return false;
-
+// RSSから <item> 内 <title> を拾う（超軽量パース）
+static bool fetchRssTitlesFrom(const char* url, String& joined, int maxItems = 6) {
   String xml;
-  if (!httpsGetString(RSS_URL, xml)) return false;
+  if (!httpsGetString(url, xml)) return false;
 
-  String joined;
-  joined.reserve(384);
-
+  joined = "";
   int count = 0;
   int pos = 0;
 
@@ -181,14 +147,67 @@ static bool fetchRssTitlesToBuf(char* dst, size_t dstsz, int maxItems = 5) {
     pos = itemE + 7;
   }
 
-  if (count <= 0) return false;
-
-  // バッファへコピー（長すぎたら切る）
-  snprintf(dst, dstsz, "%s", joined.c_str());
-  return true;
+  return (count > 0);
 }
 
-// ==== 差分描画ヘルパ ====
+static bool fetchRssWithFallback(const char* primary, const char* fallback, String& outJoined) {
+  if (fetchRssTitlesFrom(primary, outJoined)) return true;
+  return fetchRssTitlesFrom(fallback, outJoined);
+}
+
+// ===================== UI（差分描画） =====================
+struct UiCache {
+  char timeLine[16] = "";
+  char wifiLine[32] = "";
+  uint16_t wifiFg = 0xFFFF;
+
+  char jstLine[32] = "";
+  char btcLine[32] = "";
+  uint16_t btcBorder = 0xFFFF;
+
+  int tickerX = 0;
+  int tickerTotalW = 0;
+
+  uint32_t lastRssRev = 0;
+  uint32_t lastBtcRev = 0;
+};
+static UiCache ui;
+
+static const int TOP_H   = 72;
+static const int NEWS_Y  = TOP_H;
+static const int NEWS_H  = 240 - TOP_H;
+
+static const uint16_t BG_TOP   = BLACK;
+static const uint16_t BG_NEWS  = 0x2104; // かなり暗いグレー（黒ベタ感を弱める）
+static const uint16_t FG_LABEL = WHITE;
+
+static uint16_t lerp565(uint8_t r0, uint8_t g0, uint8_t b0,
+                        uint8_t r1, uint8_t g1, uint8_t b1,
+                        float t)
+{
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  uint8_t r = (uint8_t)(r0 + (r1 - r0) * t);
+  uint8_t g = (uint8_t)(g0 + (g1 - g0) * t);
+  uint8_t b = (uint8_t)(b0 + (b1 - b0) * t);
+  return M5.Display.color565(r, g, b);
+}
+
+static uint16_t btcBorderColorFromChange(double prev, double now) {
+  if (prev <= 0.0 || now <= 0.0) return WHITE;
+
+  double ch = (now - prev) / prev;      // 変動率
+  double mag = fabs(ch);
+
+  // 0.5%で最大発色（好みで調整）
+  float t = (float)(mag / 0.005);
+  if (t > 1.0f) t = 1.0f;
+
+  // ベースは暗め、上げ=緑、下げ=赤
+  if (ch >= 0.0) return lerp565(40, 40, 40, 0, 255, 0, t);
+  else           return lerp565(40, 40, 40, 255, 0, 0, t);
+}
+
 static bool drawTextIfChanged(int x, int y, int w, int h,
                               uint16_t bg, uint16_t fg, int size,
                               const char* text, char* cache, size_t cacheN,
@@ -201,399 +220,312 @@ static bool drawTextIfChanged(int x, int y, int w, int h,
   M5.Display.setTextSize(size);
   M5.Display.setCursor(x, y);
   M5.Display.print(text ? text : "");
+
   snprintf(cache, cacheN, "%s", text ? text : "");
   return true;
 }
 
-// ==== UI：静的部分（モード切替時だけ）====
-static void drawBootStatic() {
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE, BLACK);
+static void drawStaticUI() {
+  M5.Display.fillScreen(BG_TOP);
 
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(0, 0);
-  M5.Display.print("BOOT");
-  M5.Display.drawFastHLine(0, 26, M5.Display.width(), WHITE);
+  // 上段背景
+  M5.Display.fillRect(0, 0, 320, TOP_H, BG_TOP);
+
+  // 下段背景（黒ベタをやめる）
+  M5.Display.fillRect(0, NEWS_Y, 320, NEWS_H, BG_NEWS);
+  M5.Display.drawRect(0, NEWS_Y, 320, NEWS_H, 0x7BEF); // 薄い枠
 
   // ラベル
   M5.Display.setTextSize(2);
-  M5.Display.setCursor(0, 90);  M5.Display.print("WiFi:");
-  M5.Display.setCursor(0, 110); M5.Display.print("Time:");
-  M5.Display.setCursor(0, 130); M5.Display.print("BTC :");
-  M5.Display.setCursor(0, 150); M5.Display.print("RSS :");
+  M5.Display.setTextColor(FG_LABEL, BG_TOP);
 
-  // キャッシュを初期化（強制再描画を誘発）
-  memset(&uiBoot, 0, sizeof(uiBoot));
-  strcpy(uiBoot.phase, "!");
-  strcpy(uiBoot.clock, "!");
+  M5.Display.setCursor(0, 0);
+  M5.Display.print("WiFi:");
+
+  M5.Display.setCursor(0, 22);
+  M5.Display.print("JST :");
+
+  // BTCパネル枠（中身は動的）
+  M5.Display.drawRoundRect(0, 44, 320, 26, 6, WHITE);
+
+  // 区切り線
+  M5.Display.drawFastHLine(0, TOP_H - 1, 320, 0x7BEF);
 }
 
-static void drawRunStatic() {
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE, BLACK);
+// ticker 描画用 sprite
+static M5Canvas tickerSpr(&M5.Display);
 
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(0, 0);  M5.Display.print("WiFi:");
-  M5.Display.setCursor(0, 20); M5.Display.print("JST :");
-  M5.Display.setCursor(0, 40); M5.Display.print("BTC :");
-  M5.Display.drawFastHLine(0, 70, M5.Display.width(), WHITE);
-
-  memset(&uiRun, 0, sizeof(uiRun));
-  strcpy(uiRun.wifi, "!");
-  strcpy(uiRun.jstline, "!");
-  strcpy(uiRun.btc, "!");
+static void tickerRecalcTotalWidth(const String& w, const String& b, const String& t) {
+  tickerSpr.setTextSize(3);
+  String plain;
+  plain.reserve(512);
+  plain += "WORLD: ";    plain += (w.length() ? w : "(no data)");
+  plain += "   |   ";
+  plain += "BUSINESS: "; plain += (b.length() ? b : "(no data)");
+  plain += "   |   ";
+  plain += "TECH: ";     plain += (t.length() ? t : "(no data)");
+  ui.tickerTotalW = tickerSpr.textWidth(plain.c_str());
+  ui.tickerX = M5.Display.width();
 }
 
-// ==== UI：動的部分（差分のみ）====
-static void drawBootDynamic() {
-  char phase[32];
-  char wifi[8];
-  char tmode[8];
-  char btc[16];
-  char rss[16];
+static void drawTicker(const String& w, const String& b, const String& t) {
+  const int tickerH = 70;
+  const int y = NEWS_Y + (NEWS_H - tickerH) / 2;
 
-  // 共有データ取得
-  xSemaphoreTake(gMutex, portMAX_DELAY);
-  snprintf(phase, sizeof(phase), "%s", gPhase);
-  xSemaphoreGive(gMutex);
+  tickerSpr.fillSprite(BG_NEWS);
+  tickerSpr.setTextSize(3);
+  tickerSpr.setCursor(ui.tickerX, 18);
 
-  snprintf(wifi, sizeof(wifi), "%s", (WiFi.status() == WL_CONNECTED) ? "OK" : "NG");
-  snprintf(tmode, sizeof(tmode), "%s", gTimeValid ? "JST" : "Uptime");
-  snprintf(btc, sizeof(btc), "%s", (gBtcJpy > 0.0) ? "Ready" : "Pending");
-  snprintf(rss, sizeof(rss), "%s", (strlen(gRssTitles) && strcmp(gRssTitles, "(pending)") != 0) ? "Ready" : "Pending");
+  // 色（カテゴリごと）
+  const uint16_t C_WORLD = CYAN;
+  const uint16_t C_BUS   = ORANGE;
+  const uint16_t C_TECH  = MAGENTA;
+  const uint16_t C_SEP   = 0xCE59; // 明るいグレー
 
-  // phase（上段）
-  drawTextIfChanged(70, 0, 250, 22, BLACK, WHITE, 2, phase, uiBoot.phase, sizeof(uiBoot.phase));
+  auto seg = [&](uint16_t col, const char* label, const String& body) {
+    tickerSpr.setTextColor(col, BG_NEWS);
+    tickerSpr.print(label);
+    tickerSpr.print(": ");
+    tickerSpr.print(body.length() ? body : String("(no data)"));
+  };
 
-  // clock（大きめ）
-  String c = clockText();
-  drawTextIfChanged(0, 30, M5.Display.width(), 55, BLACK, WHITE, 4, c.c_str(), uiBoot.clock, sizeof(uiBoot.clock));
+  seg(C_WORLD, "WORLD", w);
+  tickerSpr.setTextColor(C_SEP, BG_NEWS);
+  tickerSpr.print("   |   ");
+  seg(C_BUS, "BUSINESS", b);
+  tickerSpr.setTextColor(C_SEP, BG_NEWS);
+  tickerSpr.print("   |   ");
+  seg(C_TECH, "TECH", t);
 
-  // status lines
-  drawTextIfChanged(70, 90,  80, 18, BLACK, WHITE, 2, wifi,  uiBoot.wifi,    sizeof(uiBoot.wifi));
-  drawTextIfChanged(70, 110, 80, 18, BLACK, WHITE, 2, tmode, uiBoot.timeMode,sizeof(uiBoot.timeMode));
-  drawTextIfChanged(70, 130, 120,18, BLACK, WHITE, 2, btc,   uiBoot.btc,     sizeof(uiBoot.btc));
-  drawTextIfChanged(70, 150, 120,18, BLACK, WHITE, 2, rss,   uiBoot.rss,     sizeof(uiBoot.rss));
+  tickerSpr.pushSprite(0, y);
+
+  // スクロール
+  ui.tickerX -= SCROLL_PX_PER_TICK;
+  if (ui.tickerX < -ui.tickerTotalW) {
+    ui.tickerX = M5.Display.width();
+  }
 }
 
-static void buildTickerText(char* out, size_t outsz) {
-  // ticker文字列をUI側で合成（ここはUIタスクのみ）
-  char rss[RSS_BUF_SZ];
-  double btc;
+static void drawTopDynamic() {
+  // WiFi状態 / RSSI / 時計 / JST / BTC を必要箇所だけ更新
+  const bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  const int rssi = wifiOk ? WiFi.RSSI() : 0;
 
-  xSemaphoreTake(gMutex, portMAX_DELAY);
-  snprintf(rss, sizeof(rss), "%s", gRssTitles);
-  btc = gBtcJpy;
-  xSemaphoreGive(gMutex);
+  // 時計（左上の空きに大きめで）
+  String clk = clockText();
+  drawTextIfChanged(110, 0, 210, 18, BG_TOP, WHITE, 2, clk.c_str(), ui.timeLine, sizeof(ui.timeLine));
 
+  // WiFi line (色付き)
+  char wbuf[32];
+  if (wifiOk) snprintf(wbuf, sizeof(wbuf), "OK  RSSI:%ddBm", rssi);
+  else        snprintf(wbuf, sizeof(wbuf), "NG  RSSI:--");
+
+  uint16_t wfg = wifiOk ? GREEN : RED;
+  bool wifiForce = (ui.wifiFg != wfg);
+  ui.wifiFg = wfg;
+
+  drawTextIfChanged(70, 0, 240, 18, BG_TOP, wfg, 2, wbuf, ui.wifiLine, sizeof(ui.wifiLine), wifiForce);
+
+  // JST datetime
   String dt = dateTimeJST();
+  drawTextIfChanged(70, 22, 250, 18, BG_TOP, WHITE, 2, dt.c_str(), ui.jstLine, sizeof(ui.jstLine));
 
-  // 可能ならここもString使わずにsnprintfだけでOK
-  snprintf(out, outsz, "JST %s   BTC/JPY %lu   NEWS %s",
-           dt.c_str(),
-           (unsigned long)btc,
-           (strlen(rss) ? rss : "(no news)"));
-}
+  // BTC panel
+  double btc, prev;
+  uint32_t btcRev;
+  xSemaphoreTake(g_lock, portMAX_DELAY);
+  btc = g_btc;
+  prev = g_btcPrev;
+  btcRev = g_btcRev;
+  xSemaphoreGive(g_lock);
 
-static void drawRunDynamic() {
-  // WiFi
-  const char* wifi = (WiFi.status() == WL_CONNECTED) ? "OK" : "NG";
-  drawTextIfChanged(70, 0, 250, 18, BLACK, WHITE, 2, wifi, uiRun.wifi, sizeof(uiRun.wifi));
-
-  // JST line（毎秒変化。変化時のみ更新）
-  String dt = dateTimeJST();
-  drawTextIfChanged(70, 20, 250, 18, BLACK, WHITE, 2, dt.c_str(), uiRun.jstline, sizeof(uiRun.jstline));
-
-  // BTC
-  char btc[24];
-  snprintf(btc, sizeof(btc), "%.0f JPY", gBtcJpy);
-  drawTextIfChanged(70, 40, 250, 18, BLACK, WHITE, 2, btc, uiRun.btc, sizeof(uiRun.btc));
-}
-
-static void drawTickerFrame(const char* tickerText) {
-  const int y = 86;
-  const int h = 40;
-
-  if (tickerSpriteOK) {
-    tickerCanvas.fillScreen(BLACK);
-    tickerCanvas.setTextColor(WHITE, BLACK);
-    tickerCanvas.setTextSize(2);
-    tickerCanvas.setCursor(tickerX, 0);
-    tickerCanvas.print(tickerText);
-    tickerCanvas.pushSprite(0, y);
+  // 表示文字
+  char bbuf[32];
+  if (btc > 0.0 && prev > 0.0) {
+    double ch = (btc - prev) / prev * 100.0;
+    snprintf(bbuf, sizeof(bbuf), "BTC/JPY %.0f  (%+.2f%%)", btc, ch);
+  } else if (btc > 0.0) {
+    snprintf(bbuf, sizeof(bbuf), "BTC/JPY %.0f", btc);
   } else {
-    // フォールバック（フリックは出やすい）
-    M5.Display.fillRect(0, y, M5.Display.width(), h, BLACK);
-    M5.Display.setTextColor(WHITE, BLACK);
+    snprintf(bbuf, sizeof(bbuf), "BTC/JPY (pending)");
+  }
+
+  uint16_t border = btcBorderColorFromChange(prev, btc);
+  bool btcForce = (ui.btcBorder != border) || (ui.lastBtcRev != btcRev);
+  ui.btcBorder = border;
+  ui.lastBtcRev = btcRev;
+
+  if (btcForce || strcmp(bbuf, ui.btcLine) != 0) {
+    // 枠
+    M5.Display.fillRect(0, 44, 320, 26, BG_TOP);
+    M5.Display.drawRoundRect(0, 44, 320, 26, 6, border);
+
+    // 文字（黄色）
+    M5.Display.setTextColor(YELLOW, BG_TOP);
     M5.Display.setTextSize(2);
-    M5.Display.setCursor(tickerX, y);
-    M5.Display.print(tickerText);
+    M5.Display.setCursor(8, 48);
+    M5.Display.print(bbuf);
+
+    snprintf(ui.btcLine, sizeof(ui.btcLine), "%s", bbuf);
   }
-
-  tickerX -= SCROLL_PX_PER_TICK;
-
-  int approxW = (int)strlen(tickerText) * 12;
-  if (tickerX < -approxW) tickerX = M5.Display.width();
 }
 
-// ==== タスク：ネットワーク（取得/状態管理）====
-static void NetTask(void* arg) {
+// ===================== タスク =====================
+static void TaskNet(void* arg) {
   (void)arg;
 
-  uint32_t wifiStart = 0;
-  uint32_t ntpStart  = 0;
-  uint32_t lastBtc   = 0;
-  uint32_t lastRss   = 0;
+  uint32_t wifiStart = millis();
+  uint32_t ntpStart = 0;
+  bool ntpStarted = false;
 
-  gState = INIT_WIFI;
-  setPhase("WiFi connecting");
-  startWifi();
-  wifiStart = millis();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t lastBtc = 0;
+  uint32_t lastRss = 0;
 
   for (;;) {
-    gWiFiStatus = WiFi.status();
-    updateTimeValidFlag();
-
     uint32_t now = millis();
 
-    switch (gState) {
-      case INIT_WIFI:
-        if (WiFi.status() == WL_CONNECTED) {
-          setPhase("Time syncing");
-          startNtpJST();
-          ntpStart = now;
-          gState = INIT_NTP;
-          gDirtyStatus = true;
-        } else if (now - wifiStart > WIFI_TIMEOUT_MS) {
-          setPhase("Offline mode");
-          gState = OFFLINE;
-          gDirtyStatus = true;
-        }
-        break;
-
-      case INIT_NTP:
-        if (isTimeValidLocal()) {
-          setPhase("Fetching feeds");
-          gState = INIT_FETCH;
-          gDirtyStatus = true;
-        } else if (now - ntpStart > NTP_TIMEOUT_MS) {
-          setPhase("Fetching feeds");
-          gState = INIT_FETCH;
-          gDirtyStatus = true;
-        }
-        break;
-
-      case INIT_FETCH: {
-        if (WiFi.status() == WL_CONNECTED) {
-          double v;
-          if (fetchBtc(v)) {
-            xSemaphoreTake(gMutex, portMAX_DELAY);
-            gBtcJpy = v;
-            xSemaphoreGive(gMutex);
-            gDirtyStatus = true;
-            gDirtyTicker = true;
-          }
-
-          char buf[RSS_BUF_SZ];
-          if (fetchRssTitlesToBuf(buf, sizeof(buf))) {
-            xSemaphoreTake(gMutex, portMAX_DELAY);
-            snprintf(gRssTitles, sizeof(gRssTitles), "%s", buf);
-            xSemaphoreGive(gMutex);
-            gDirtyStatus = true;
-            gDirtyTicker = true;
-          } else {
-            xSemaphoreTake(gMutex, portMAX_DELAY);
-            snprintf(gRssTitles, sizeof(gRssTitles), "%s", "(RSS fetch failed)");
-            xSemaphoreGive(gMutex);
-            gDirtyStatus = true;
-            gDirtyTicker = true;
-          }
-
-          lastBtc = now;
-          lastRss = now;
-          setPhase("Running");
-          gState = RUNNING;
-        } else {
-          xSemaphoreTake(gMutex, portMAX_DELAY);
-          snprintf(gRssTitles, sizeof(gRssTitles), "%s", "(No WiFi)");
-          xSemaphoreGive(gMutex);
-          gDirtyStatus = true;
-          gDirtyTicker = true;
-
-          setPhase("Offline mode");
-          gState = OFFLINE;
-        }
-      } break;
-
-      case RUNNING:
-        if (WiFi.status() != WL_CONNECTED) {
-          setPhase("Offline mode");
-          xSemaphoreTake(gMutex, portMAX_DELAY);
-          snprintf(gRssTitles, sizeof(gRssTitles), "%s", "(WiFi lost)");
-          xSemaphoreGive(gMutex);
-          gDirtyStatus = true;
-          gDirtyTicker = true;
-          gState = OFFLINE;
+    // WiFi接続管理
+    if (WiFi.status() != WL_CONNECTED) {
+      if (now - wifiStart > WIFI_TIMEOUT_MS) {
+        // 定期的に再トライ
+        if (now - wifiStart > 10000) {
+          WiFi.disconnect(true, true);
+          WiFi.begin(WIFI_SSID, WIFI_PASS);
           wifiStart = now;
-          break;
         }
-
-        if (now - lastBtc >= BTC_UPDATE_MS) {
-          double v;
-          if (fetchBtc(v)) {
-            xSemaphoreTake(gMutex, portMAX_DELAY);
-            gBtcJpy = v;
-            xSemaphoreGive(gMutex);
-            gDirtyStatus = true;
-            gDirtyTicker = true;
-          }
-          lastBtc = now;
-        }
-
-        if (now - lastRss >= RSS_UPDATE_MS) {
-          char buf[RSS_BUF_SZ];
-          if (fetchRssTitlesToBuf(buf, sizeof(buf))) {
-            xSemaphoreTake(gMutex, portMAX_DELAY);
-            snprintf(gRssTitles, sizeof(gRssTitles), "%s", buf);
-            xSemaphoreGive(gMutex);
-            gDirtyStatus = true;
-            gDirtyTicker = true;
-          }
-          lastRss = now;
-        }
-        break;
-
-      case OFFLINE:
-        if (WiFi.status() != WL_CONNECTED) {
-          // 10秒ごとに再接続
-          if (now - wifiStart > 10000) {
-            setPhase("WiFi reconnect");
-            startWifi();
-            wifiStart = now;
-            gDirtyStatus = true;
-          }
-        } else {
-          // 復帰したらNTP→FETCHへ
-          if (!isTimeValidLocal()) {
-            setPhase("Time syncing");
-            startNtpJST();
-            ntpStart = now;
-            gState = INIT_NTP;
-          } else {
-            setPhase("Fetching feeds");
-            gState = INIT_FETCH;
-          }
-          gDirtyStatus = true;
-        }
-        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // NTP開始
+    if (!isTimeValid() && !ntpStarted) {
+      startNtpJST();
+      ntpStart = now;
+      ntpStarted = true;
+    }
+    if (ntpStarted && !isTimeValid() && (now - ntpStart > NTP_TIMEOUT_MS)) {
+      // 諦めても動かす（uptime時計のまま）
+      ntpStarted = false;
+    }
+    if (isTimeValid()) ntpStarted = false;
+
+    // BTC
+    if (now - lastBtc >= BTC_UPDATE_MS) {
+      double v;
+      if (fetchBtcOnce(v)) {
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        g_btcPrev = (g_btc > 0.0) ? g_btc : v; // 初回はprev=now
+        g_btc = v;
+        g_btcRev++;
+        xSemaphoreGive(g_lock);
+      }
+      lastBtc = now;
+    }
+
+    // RSS（3本）
+    if (now - lastRss >= RSS_UPDATE_MS) {
+      String w, b, t;
+
+      bool okW = fetchRssWithFallback(RSS_WORLD_PRIMARY,    RSS_WORLD_FALLBACK,    w);
+      bool okB = fetchRssWithFallback(RSS_BUSINESS_PRIMARY, RSS_BUSINESS_FALLBACK, b);
+      bool okT = fetchRssWithFallback(RSS_TECH_PRIMARY,     RSS_TECH_FALLBACK,     t);
+
+      xSemaphoreTake(g_lock, portMAX_DELAY);
+      g_world    = okW ? w : String("(world fetch failed)");
+      g_business = okB ? b : String("(business fetch failed)");
+      g_tech     = okT ? t : String("(tech fetch failed)");
+      g_rssRev++;
+      xSemaphoreGive(g_lock);
+
+      lastRss = now;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
-// ==== タスク：UI（描画のみ）====
-static void UiTask(void* arg) {
+static void TaskUi(void* arg) {
   (void)arg;
 
-  // 初回はBoot静的を描く
-  InitState lastMode = INIT_WIFI;
-  drawBootStatic();
+  // ticker sprite 初期化
+  tickerSpr.createSprite(320, 70);
+  tickerSpr.setTextWrap(false);
 
-  // ティッカー文字列
-  static char ticker[TICKER_BUF_SZ];
-  buildTickerText(ticker, sizeof(ticker));
-  tickerX = M5.Display.width();
+  drawStaticUI();
 
-  uint32_t lastUi = millis();
-  uint32_t lastSecond = 0;
+  uint32_t lastTop = 0;
+  uint32_t lastTick = 0;
+
+  // ticker初期幅
+  {
+    String w, b, t;
+    uint32_t rev;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    w = g_world; b = g_business; t = g_tech; rev = g_rssRev;
+    xSemaphoreGive(g_lock);
+    ui.lastRssRev = rev;
+    tickerRecalcTotalWidth(w, b, t);
+  }
 
   for (;;) {
-    M5.update();
     uint32_t now = millis();
 
-    // 1秒ごとに「時間系」だけ更新（差分描画が効く）
-    uint32_t sec = now / 1000;
-    if (sec != lastSecond) {
-      lastSecond = sec;
-      // 時刻が進んだらティッカーも更新したい人向け（必要ならON）
-      gDirtyTicker = true;
+    // 上段（必要な矩形だけ更新）
+    if (now - lastTop >= TOP_UI_MS) {
+      drawTopDynamic();
+      lastTop = now;
     }
 
-    if (now - lastUi >= UI_TICK_MS) {
-      InitState mode = gState;
+    // 下段 ticker（ここだけは毎フレーム描き直す）
+    if (now - lastTick >= TICKER_MS) {
+      String w, b, t;
+      uint32_t rev;
+      xSemaphoreTake(g_lock, portMAX_DELAY);
+      w = g_world; b = g_business; t = g_tech; rev = g_rssRev;
+      xSemaphoreGive(g_lock);
 
-      // モード切替時は静的部分を描き直し（ここだけ全消去OK）
-      if (mode != lastMode) {
-        if (mode == RUNNING) drawRunStatic();
-        else drawBootStatic();
-        lastMode = mode;
+      if (rev != ui.lastRssRev) {
+        ui.lastRssRev = rev;
+        tickerRecalcTotalWidth(w, b, t);
       }
 
-      if (mode == RUNNING) {
-        // 変化したところだけ
-        if (gDirtyStatus) {
-          gDirtyStatus = false;
-          drawRunDynamic();
-        } else {
-          // JSTは秒で変わるので、ここは差分で毎tick呼んでもOK
-          drawRunDynamic();
-        }
-
-        if (gDirtyTicker) {
-          gDirtyTicker = false;
-          buildTickerText(ticker, sizeof(ticker));
-          tickerX = M5.Display.width();
-        }
-        drawTickerFrame(ticker);
-
-      } else {
-        // Boot/Offline表示（差分のみ）
-        if (gDirtyStatus) {
-          gDirtyStatus = false;
-          drawBootDynamic();
-        } else {
-          // 時計だけは動かす（差分で）
-          drawBootDynamic();
-        }
-      }
-
-      lastUi = now;
+      drawTicker(w, b, t);
+      lastTick = now;
     }
 
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
+// ===================== setup / loop =====================
 void setup() {
-  Serial.begin(115200);
-
   auto cfg = M5.config();
   M5.begin(cfg);
 
-  // 表示の初動保証（あなたの参考コードに寄せる）
-  M5.Speaker.end();
   M5.Display.setBrightness(255);
-  M5.Display.setRotation(1);
   M5.Display.setTextColor(WHITE, BLACK);
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setCursor(10, 10);
-  M5.Display.setTextSize(2);
-  M5.Display.print("Start");
 
-  // mutex
-  gMutex = xSemaphoreCreateMutex();
+  g_lock = xSemaphoreCreateMutex();
 
-  // ティッカースプライト（滑らか化）
-  tickerSpriteOK = tickerCanvas.createSprite(M5.Display.width(), 40);
+  // 初期ダミー値
+  xSemaphoreTake(g_lock, portMAX_DELAY);
+  g_world = "(fetching...)";
+  g_business = "(fetching...)";
+  g_tech = "(fetching...)";
+  xSemaphoreGive(g_lock);
 
-  // タスク起動：UIはCore1、ネットはCore0推奨
-  xTaskCreatePinnedToCore(UiTask,  "UiTask",  8192,  nullptr, 2, nullptr, 1);
-  xTaskCreatePinnedToCore(NetTask, "NetTask", 8192,  nullptr, 1, nullptr, 0);
+  // タスク起動（NetはCore0、UIはCore1）
+  xTaskCreatePinnedToCore(TaskNet, "net", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(TaskUi,  "ui",  8192, nullptr, 2, nullptr, 1);
 
-  // あなたの流儀：setup内常駐
-  for(;;) {
-    delay(1000);
+  // 仕様どおり loop は使わず、setup常駐
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
