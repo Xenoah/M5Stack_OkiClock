@@ -56,14 +56,17 @@ static const int TOP_H   = 72;
 static const int NEWS_Y  = TOP_H;
 static const int NEWS_H  = 240 - TOP_H;
 
-static const uint16_t BG_TOP  = BLACK;
-static const uint16_t BG_NEWS = 0x3186; // 暗灰（黒ベタ回避）
+// カラーパレット（ダークネイビー系）
+static const uint16_t BG_TOP    = 0x0862; // 深い濃紺
+static const uint16_t BG_PANEL  = 0x10C4; // やや明るいパネル
+static const uint16_t BG_NEWS   = 0x0842; // ニュース背景（さらに暗く）
+static const uint16_t C_ACCENT  = 0x05FA; // シアンアクセント
+static const uint16_t C_DIM     = 0x3A8D; // 薄いテキスト
 
-// 0行目(18px)は「RSSI専用」で毎回塗り直す → 時刻混入対策
-static const int LINE0_Y = 0;
-static const int LINE0_H = 18;
-
-static const int CLK_X = 225; // 右上に時計
+static const int LINE0_Y  = 0;
+static const int LINE0_H  = 18;
+static const int CLK_X    = 220; // 右上に時計
+static const int BADGE_W  = 70;  // ニュースバッジ幅
 
 // ===================== 便利関数 =====================
 static bool isTimeValid() {
@@ -118,7 +121,27 @@ static uint16_t btcBorderColorFromChange(double prev, double now) {
   return (ch >= 0.0) ? lerp565(30,30,30, 0,255,0, t) : lerp565(30,30,30, 255,0,0, t);
 }
 
-// よく出るUnicode記号をASCII寄せ（BBCでも “ ” – … が混ざる）
+// WiFiシグナル強度をバー数(0-4)に変換
+static int rssiToBars(int rssi) {
+  if (rssi >= -65) return 4;
+  if (rssi >= -75) return 3;
+  if (rssi >= -85) return 2;
+  return 1;
+}
+
+// WiFiシグナルバー描画（スプライト用）
+static void drawWifiBars(M5Canvas& c, int x, int y, int bars) {
+  static const uint16_t BARCOLS[] = {C_DIM, 0xF800, 0xFD20, 0xFFE0, 0x07E0};
+  uint16_t activeCol = BARCOLS[bars];
+  for (int b = 0; b < 4; b++) {
+    int bh = 6 + b * 3;
+    int bx = x + b * 7;
+    int by = y - bh;
+    c.fillRect(bx, by, 5, bh, (b < bars) ? activeCol : C_DIM);
+  }
+}
+
+// よく出るUnicode記号をASCII寄せ（BBCでも “ “ – … が混ざる）
 static void sanitizeUtf8ToAscii(String& s) {
   String out; out.reserve(s.length());
   auto match3 = [&](size_t i, uint8_t a, uint8_t b, uint8_t c) -> bool {
@@ -161,6 +184,19 @@ static bool httpsGetStream(const char* url, HTTPClient& http, WiFiClientSecure& 
 }
 
 // ===================== RSS：ストリーム解析（XML丸ごと保持しない） =====================
+// HTMLタグを除去（<tag> や <tag/> をすべて削除）
+static void stripHtmlTags(String& s) {
+  String out; out.reserve(s.length());
+  bool inTag = false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '<')       { inTag = true;  continue; }
+    if (c == '>')       { inTag = false; continue; }
+    if (!inTag) out += c;
+  }
+  s = out;
+}
+
 static void decodeEntities(String& s) {
   s.replace("&amp;", "&");
   s.replace("&lt;", "<");
@@ -247,8 +283,10 @@ static bool fetchRssTitlesStreamToBuf(const char* url, char* dst, size_t dstsz, 
             inTitle = false;
             checkingEnd = false;
             mtE = 0;
-            // 整形して追加
+            // 整形して追加（タグ除去→エンティティ展開→ASCII変換の順）
+            stripHtmlTags(title);
             decodeEntities(title);
+            stripHtmlTags(title);    // &lt;tag&gt; が展開された場合も除去
             sanitizeUtf8ToAscii(title);
             title.trim();
 
@@ -305,8 +343,9 @@ static bool fetchBtc(double& outBtc) {
   return true;
 }
 
-// ===================== UI：ニュース4段（スプライト1枚使い回し） =====================
-static M5Canvas newsSpr(&M5.Display); // 320x40 1枚のみ
+// ===================== UI：スプライト =====================
+static M5Canvas topSpr (&M5.Display); // 320x72  上段用
+static M5Canvas newsSpr(&M5.Display); // 320x40  ニュース1段分
 
 struct NewsLine {
   String text;
@@ -339,122 +378,185 @@ static void rebuild4LinesIfNeeded() {
   if (rev == lastSeenRssRev) return;
   lastSeenRssRev = rev;
 
-  lines[0].text = String("WORLD: ") + wbuf;
-  lines[1].text = String("BUSINESS: ") + bbuf;
-  lines[2].text = String("TECH: ") + tbuf;
-  lines[3].text = String("MIX: ") + firstItem(wbuf) + "  |  " + firstItem(bbuf) + "  |  " + firstItem(tbuf);
+  // バッジにカテゴリを表示するのでテキストにプレフィックス不要
+  lines[0].text = String(wbuf);
+  lines[1].text = String(bbuf);
+  lines[2].text = String(tbuf);
+  lines[3].text = firstItem(wbuf) + "  //  " + firstItem(bbuf) + "  //  " + firstItem(tbuf);
 
-  lines[0].color = CYAN;
-  lines[1].color = ORANGE;
-  lines[2].color = MAGENTA;
-  lines[3].color = WHITE;
+  lines[0].color = 0x07FF; // CYAN
+  lines[1].color = 0xFD20; // ORANGE
+  lines[2].color = 0xF81F; // MAGENTA
+  lines[3].color = 0xFFFF; // WHITE
 
-  newsSpr.setTextSize(3);
-  for (int i=0;i<4;i++){
+  newsSpr.setTextSize(2);
+  for (int i = 0; i < 4; i++) {
     lines[i].w = newsSpr.textWidth(lines[i].text.c_str());
-    if (lines[i].w < 1) lines[i].w = lines[i].text.length() * 18;
-    lines[i].x = M5.Display.width();
+    if (lines[i].w < 1) lines[i].w = lines[i].text.length() * 12;
+    lines[i].x = 250; // スプライト幅（右端から開始）
   }
 }
 
 static void drawStaticUI() {
   M5.Display.fillScreen(BG_TOP);
-  M5.Display.fillRect(0, NEWS_Y, 320, NEWS_H, BG_NEWS);
-  M5.Display.drawFastHLine(0, TOP_H-1, 320, 0x7BEF);
 
-  // 上段ラベル
-  M5.Display.setTextColor(WHITE, BG_TOP);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(0, 22); M5.Display.print("JST :");
-  // BTC枠だけは静的枠を描かず、毎回描画側で描く（枠色が変わるため）
+  // ニュースエリア背景
+  M5.Display.fillRect(0, NEWS_Y, 320, NEWS_H, BG_NEWS);
+
+  // アクセントライン
+  M5.Display.drawFastHLine(0, TOP_H - 1, 320, C_ACCENT);
+
+  // ニュースバッジエリア（静的：1回だけ描画）
+  static const char* LABELS[]  = {"WORLD", "BIZ  ", "TECH ", "MIX  "};
+  static const uint16_t BCOLS[] = {0x07FF, 0xFD20, 0xF81F, 0xFFFF}; // CYAN/ORANGE/MAGENTA/WHITE
+
+  for (int i = 0; i < 4; i++) {
+    int y = NEWS_Y + i * 42;
+    M5.Display.fillRect(0, y, BADGE_W, 41, BG_PANEL);     // バッジ背景
+    M5.Display.fillRect(0, y, 5,       41, BCOLS[i]);      // 左カラーバー
+    M5.Display.drawFastVLine(BADGE_W, y, 41, C_DIM);       // 右境界線
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(BCOLS[i], BG_PANEL);
+    M5.Display.setCursor(9, y + 13);
+    M5.Display.print(LABELS[i]);
+  }
 }
 
 static void drawTopDynamic() {
-  // 0行目は毎回塗り直す（RSSIに時計が混ざる問題を根絶）
-  M5.Display.fillRect(0, LINE0_Y, 320, LINE0_H, BG_TOP);
+  topSpr.fillSprite(BG_TOP);
 
   const bool wifiOk = (WiFi.status() == WL_CONNECTED);
   int rssi = wifiOk ? WiFi.RSSI() : 0;
 
-  // RSSI表示（左側固定）
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(wifiOk ? GREEN : RED, BG_TOP);
-  M5.Display.setCursor(0, 0);
-  if (wifiOk) M5.Display.printf("WiFi OK RSSI:%ddBm", rssi);
-  else        M5.Display.print("WiFi NG RSSI:--");
+  // ── ステータスバー (y=0..21) ──
+  topSpr.fillRect(0, 0, 320, 22, BG_PANEL);
 
-  // 時計（右上固定）
-  M5.Display.setTextColor(WHITE, BG_TOP);
-  M5.Display.setCursor(CLK_X, 0);
-  M5.Display.print(clockText());
+  // WiFiシグナルバー (x=4, 下端y=17)
+  drawWifiBars(topSpr, 4, 17, wifiOk ? rssiToBars(rssi) : 0);
 
-  // JST
-  M5.Display.fillRect(70, 22, 250, 18, BG_TOP);
-  M5.Display.setCursor(70, 22);
-  M5.Display.setTextColor(WHITE, BG_TOP);
-  M5.Display.print(dateTimeJST());
+  // RSSI数値
+  topSpr.setTextSize(1);
+  topSpr.setTextColor(wifiOk ? 0x07E0 : 0xF800);
+  topSpr.setCursor(34, 7);
+  if (wifiOk) topSpr.printf("%ddBm", rssi);
+  else        topSpr.print("--");
 
-  // BTC（黄色文字＋枠色）
+  // 時計（右上）
+  topSpr.setTextSize(2);
+  topSpr.setTextColor(WHITE);
+  topSpr.setCursor(CLK_X, 3);
+  topSpr.print(clockText());
+
+  // ステータスバー下線
+  topSpr.drawFastHLine(0, 21, 320, C_ACCENT);
+
+  // ── 日付行 (y=22..43) ──
+  topSpr.setTextSize(2);
+  topSpr.setTextColor(C_DIM);
+  topSpr.setCursor(4, 25);
+  topSpr.print(dateTimeJST());
+
+  // 日付下線
+  topSpr.drawFastHLine(0, 43, 320, C_ACCENT);
+
+  // ── BTC行 (y=44..71) ──
+  topSpr.fillRect(0, 44, 320, 28, BG_PANEL);
+
   double btc, prev;
   uint32_t rev;
   xSemaphoreTake(gMutex, portMAX_DELAY);
   btc = gBtc; prev = gBtcPrev; rev = gBtcRev;
   xSemaphoreGive(gMutex);
 
-  char bline[48];
+  uint16_t btcAccent = btcBorderColorFromChange(prev, btc);
+  topSpr.fillRect(0, 44, 5, 28, btcAccent); // 左カラーバー
+
+  char bline[56];
   if (btc > 0.0 && prev > 0.0) {
     double ch = (btc - prev) / prev * 100.0;
-    snprintf(bline, sizeof(bline), "BTC/JPY %.0f  (%+.2f%%)", btc, ch);
+    char arrow = (ch >= 0) ? '^' : 'v';
+    snprintf(bline, sizeof(bline), "BTC/JPY %c %.0f (%+.2f%%)", arrow, btc, ch);
   } else if (btc > 0.0) {
-    snprintf(bline, sizeof(bline), "BTC/JPY %.0f", btc);
+    snprintf(bline, sizeof(bline), "BTC/JPY  %.0f", btc);
   } else {
-    snprintf(bline, sizeof(bline), "BTC/JPY (pending)");
+    snprintf(bline, sizeof(bline), "BTC/JPY  (pending)");
   }
 
-  uint16_t border = btcBorderColorFromChange(prev, btc);
-  // BTC領域描画
-  M5.Display.fillRect(0, 44, 320, 26, BG_TOP);
-  M5.Display.drawRoundRect(0, 44, 320, 26, 6, border);
-  M5.Display.setTextColor(YELLOW, BG_TOP);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(8, 48);
-  M5.Display.print(bline);
+  topSpr.setTextSize(2);
+  topSpr.setTextColor(0xFFE0); // YELLOW
+  topSpr.setCursor(10, 50);
+  topSpr.print(bline);
 
+  topSpr.pushSprite(0, 0);
   (void)rev;
 }
 
 static void drawNews4Lines() {
-  const int lineH = 40;
-  const int startY = NEWS_Y + 4;
+  const int lineH  = 42;
+  const int startY = NEWS_Y;
 
   newsSpr.setTextWrap(false);
-  newsSpr.setTextSize(3);
+  newsSpr.setTextSize(2);
 
-  for (int i=0;i<4;i++){
-    newsSpr.fillSprite(BG_NEWS);
-    newsSpr.setTextColor(lines[i].color, BG_NEWS);
-    newsSpr.setCursor(lines[i].x, 8);
+  for (int i = 0; i < 4; i++) {
+    // 偶数行/奇数行で背景色を微妙に変えて視認性UP
+    uint16_t rowBg = (i % 2 == 0) ? BG_NEWS : (uint16_t)(BG_NEWS + 0x0020);
+    newsSpr.fillSprite(rowBg);
+    newsSpr.setTextColor(lines[i].color, rowBg);
+    newsSpr.setCursor(lines[i].x, 13); // 42px中央寄せ（(42-16)/2=13）
     newsSpr.print(lines[i].text);
 
-    newsSpr.pushSprite(0, startY + i*lineH);
+    // バッジ右端（x=BADGE_W）からスプライトを押し出す
+    newsSpr.pushSprite(BADGE_W, startY + i * lineH);
 
     lines[i].x -= SCROLL_PX_PER_TICK;
-    if (lines[i].x < -lines[i].w) lines[i].x = M5.Display.width();
+    if (lines[i].x < -lines[i].w) lines[i].x = 250;
   }
 }
 
 // ===================== センサーページ =====================
 // 静的部分：ページ切替時に1回だけ呼ぶ
 static void drawSensorPageStatic() {
-  M5.Display.fillScreen(BLACK);
+  M5.Display.fillScreen(BG_TOP);
+
+  // ヘッダー (y=0..23)
+  M5.Display.fillRect(0, 0, 320, 23, BG_PANEL);
   M5.Display.setTextSize(2);
-  M5.Display.setTextColor(CYAN, BLACK);
-  M5.Display.setCursor(80, 5);
-  M5.Display.print("ENV III SENSOR");
-  M5.Display.drawFastHLine(0, 26, 320, 0x7BEF);
-  M5.Display.drawFastHLine(0, 208, 320, 0x7BEF);
-  M5.Display.setTextColor(0x7BEF, BLACK);
-  M5.Display.setCursor(70, 215);
+  M5.Display.setTextColor(C_ACCENT, BG_PANEL);
+  M5.Display.setCursor(84, 4);
+  M5.Display.print("-- ENV III SENSOR --");
+  M5.Display.drawFastHLine(0, 23, 320, C_ACCENT);
+
+  // 温度セクション (y=24..95)
+  M5.Display.fillRect(0, 24, 5, 72, 0xFD20);        // 左バー ORANGE
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(C_DIM, BG_TOP);
+  M5.Display.setCursor(14, 30);
+  M5.Display.print("TEMPERATURE");
+  M5.Display.drawFastHLine(5, 95, 315, C_DIM);
+
+  // 湿度セクション (y=96..167)
+  M5.Display.fillRect(0, 96, 320, 72, BG_PANEL);
+  M5.Display.fillRect(0, 96, 5, 72, 0x07E0);        // 左バー GREEN
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(C_DIM, BG_PANEL);
+  M5.Display.setCursor(14, 102);
+  M5.Display.print("HUMIDITY");
+  // プログレスバー背景
+  M5.Display.fillRect(14, 153, 294, 8, C_DIM);
+  M5.Display.drawFastHLine(5, 167, 315, C_DIM);
+
+  // 気圧セクション (y=168..239)
+  M5.Display.fillRect(0, 168, 5, 72, 0xFFE0);       // 左バー YELLOW
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(C_DIM, BG_TOP);
+  M5.Display.setCursor(14, 174);
+  M5.Display.print("PRESSURE");
+
+  // フッターヒント
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(C_DIM, BG_TOP);
+  M5.Display.setCursor(220, 228);
   M5.Display.print("[C] Clock/News");
 }
 
@@ -465,25 +567,30 @@ static void drawSensorPage() {
   temp = gTemp; humid = gHumid; pressure = gPressure;
   xSemaphoreGive(gMutex);
 
-  M5.Display.setTextSize(3);
+  // 温度値 (size4=32px高, y=50でセクション内中央)
+  M5.Display.setTextSize(4);
+  M5.Display.setTextColor(0xFD20, BG_TOP); // ORANGE
+  M5.Display.setCursor(14, 50);
+  if (!isnan(temp))   M5.Display.printf("  %5.1f C", temp);
+  else                M5.Display.print ("    --- C");
 
-  // 温度（背景色付きで上書き → ちらつきなし）
-  M5.Display.setTextColor(ORANGE, BLACK);
-  M5.Display.setCursor(10, 40);
-  if (!isnan(temp))   M5.Display.printf("Temp  %5.1f C", temp);
-  else                M5.Display.print ("Temp    --- C");
+  // 湿度値
+  M5.Display.setTextColor(0x07E0, BG_PANEL); // GREEN
+  M5.Display.setCursor(14, 118);
+  if (!isnan(humid))  M5.Display.printf("  %5.1f %%", humid);
+  else                M5.Display.print ("    --- %%");
 
-  // 湿度
-  M5.Display.setTextColor(GREEN, BLACK);
-  M5.Display.setCursor(10, 100);
-  if (!isnan(humid))  M5.Display.printf("Humid %5.1f %%", humid);
-  else                M5.Display.print ("Humid   --- %%");
+  // 湿度プログレスバー
+  int barW = (!isnan(humid) && humid > 0) ? (int)(humid / 100.0f * 294) : 0;
+  if (barW > 294) barW = 294;
+  M5.Display.fillRect(14,       153, barW,       8, 0x07E0); // GREEN
+  M5.Display.fillRect(14 + barW, 153, 294 - barW, 8, C_DIM);
 
-  // 気圧
-  M5.Display.setTextColor(YELLOW, BLACK);
-  M5.Display.setCursor(10, 160);
-  if (!isnan(pressure)) M5.Display.printf("Pres %6.1f hPa", pressure);
-  else                  M5.Display.print ("Pres    --- hPa");
+  // 気圧値
+  M5.Display.setTextColor(0xFFE0, BG_TOP); // YELLOW
+  M5.Display.setCursor(14, 192);
+  if (!isnan(pressure)) M5.Display.printf(" %6.1f hPa", pressure);
+  else                  M5.Display.print ("   ---  hPa");
 }
 
 // ===================== タスク =====================
@@ -567,8 +674,9 @@ static void NetTask(void* arg){
 static void UiTask(void* arg){
   (void)arg;
 
-  // ニューススプライトは「1枚だけ」
-  newsSpr.createSprite(320, 40);
+  // スプライト生成（上段: 320x72, ニュース: 250x42）
+  topSpr.createSprite(320, TOP_H);
+  newsSpr.createSprite(250, 42);
 
   drawStaticUI();
 
