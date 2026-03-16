@@ -191,14 +191,21 @@ static bool httpsGetStream(const char* url, HTTPClient& http, WiFiClientSecure& 
 }
 
 // ===================== RSS：ストリーム解析（XML丸ごと保持しない） =====================
-// HTMLタグを除去（<tag> や <tag/> をすべて削除）
+// HTMLタグを除去（<letter や </ や <! で始まる場合のみタグとみなす）
+// &lt; → < に展開された "5 < 6" のような文字は誤って削除しない
 static void stripHtmlTags(String& s) {
   String out; out.reserve(s.length());
   bool inTag = false;
   for (size_t i = 0; i < s.length(); i++) {
     char c = s[i];
-    if (c == '<')       { inTag = true;  continue; }
-    if (c == '>')       { inTag = false; continue; }
+    if (!inTag && c == '<') {
+      char nx = (i + 1 < s.length()) ? s[i + 1] : '\0';
+      if (isalpha((unsigned char)nx) || nx == '/' || nx == '!') {
+        inTag = true; continue; // 正規HTMLタグ → 除去
+      }
+      // それ以外の < は普通の文字として残す
+    }
+    if (inTag && c == '>')  { inTag = false; continue; }
     if (!inTag) out += c;
   }
   s = out;
@@ -351,37 +358,22 @@ static bool fetchBtc(double& outBtc) {
 }
 
 // ===================== 為替レート =====================
+// frankfurter.app: 必要な通貨だけリクエスト → 小さいJSON → getString で安全に取得
+static const char* RATES_URL =
+  "https://api.frankfurter.app/latest?from=USD&to=JPY,EUR,GBP,CNY,AUD,CAD,CHF,HKD,SGD,KRW,INR,MXN";
+
 static bool fetchRates(char* dst, size_t dstsz) {
   WiFiClientSecure client;
-  client.setInsecure();
   HTTPClient http;
-  http.setTimeout(6000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setUserAgent("Mozilla/5.0 (M5Stack; ESP32) RatesClient/1.0");
-  if (!http.begin(client, "https://open.er-api.com/v6/latest/USD")) return false;
+  if (!httpsGetStream(RATES_URL, http, client)) return false;
   int code = http.GET();
   if (code != 200) { http.end(); return false; }
-
-  // フィルターで必要な通貨だけ抽出
-  JsonDocument filter;
-  filter["rates"]["JPY"] = true;
-  filter["rates"]["EUR"] = true;
-  filter["rates"]["GBP"] = true;
-  filter["rates"]["CNY"] = true;
-  filter["rates"]["AUD"] = true;
-  filter["rates"]["CAD"] = true;
-  filter["rates"]["CHF"] = true;
-  filter["rates"]["HKD"] = true;
-  filter["rates"]["SGD"] = true;
-  filter["rates"]["KRW"] = true;
-  filter["rates"]["INR"] = true;
-  filter["rates"]["MXN"] = true;
+  String body = http.getString();
+  http.end();
+  if (body.length() == 0) return false;
 
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream(),
-                               DeserializationOption::Filter(filter));
-  http.end();
-  if (err) return false;
+  if (deserializeJson(doc, body)) return false;
 
   static const struct { const char* code; int dec; } PAIRS[] = {
     {"JPY",1},{"EUR",4},{"GBP",4},{"CNY",4},{"AUD",4},
@@ -712,7 +704,7 @@ static void NetTask(void* arg){
 
   uint32_t lastBtc   = 0;
   uint32_t lastRss   = 0;
-  uint32_t lastRates = 0;
+  uint32_t lastRates = RATES_UPDATE_MS; // 起動直後に1回フェッチ
 
   for(;;){
     uint32_t now = millis();
