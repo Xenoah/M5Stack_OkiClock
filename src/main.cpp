@@ -444,23 +444,30 @@ static void drawNews4Lines() {
 }
 
 // ===================== センサーページ =====================
+// 静的部分：ページ切替時に1回だけ呼ぶ
+static void drawSensorPageStatic() {
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(CYAN, BLACK);
+  M5.Display.setCursor(80, 5);
+  M5.Display.print("ENV III SENSOR");
+  M5.Display.drawFastHLine(0, 26, 320, 0x7BEF);
+  M5.Display.drawFastHLine(0, 208, 320, 0x7BEF);
+  M5.Display.setTextColor(0x7BEF, BLACK);
+  M5.Display.setCursor(70, 215);
+  M5.Display.print("[C] Clock/News");
+}
+
+// 動的部分：値のみ上書き（fillScreen なし → ちらつきゼロ）
 static void drawSensorPage() {
   float temp, humid, pressure;
   xSemaphoreTake(gMutex, portMAX_DELAY);
   temp = gTemp; humid = gHumid; pressure = gPressure;
   xSemaphoreGive(gMutex);
 
-  M5.Display.fillScreen(BLACK);
-
-  // ヘッダー
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(CYAN, BLACK);
-  M5.Display.setCursor(80, 5);
-  M5.Display.print("ENV III SENSOR");
-  M5.Display.drawFastHLine(0, 26, 320, 0x7BEF);
-
-  // 温度
   M5.Display.setTextSize(3);
+
+  // 温度（背景色付きで上書き → ちらつきなし）
   M5.Display.setTextColor(ORANGE, BLACK);
   M5.Display.setCursor(10, 40);
   if (!isnan(temp))   M5.Display.printf("Temp  %5.1f C", temp);
@@ -477,13 +484,6 @@ static void drawSensorPage() {
   M5.Display.setCursor(10, 160);
   if (!isnan(pressure)) M5.Display.printf("Pres %6.1f hPa", pressure);
   else                  M5.Display.print ("Pres    --- hPa");
-
-  // フッター
-  M5.Display.drawFastHLine(0, 208, 320, 0x7BEF);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(0x7BEF, BLACK);
-  M5.Display.setCursor(70, 215);
-  M5.Display.print("[C] Clock/News");
 }
 
 // ===================== タスク =====================
@@ -595,14 +595,15 @@ static void UiTask(void* arg){
     page = gPage;
     xSemaphoreGive(gMutex);
 
-    // ページ切替時に画面リセット
+    // ページ切替時に静的部分を一度だけ描画
     if (page != curPage) {
       curPage = page;
       if (page == 0) {
         drawStaticUI();
         lastTop = 0; lastNews = 0; // 即時更新
       } else {
-        lastSensorDraw = 0; // 即時更新
+        drawSensorPageStatic(); // fillScreen はここだけ
+        lastSensorDraw = 0;     // 即時更新
       }
     }
 
