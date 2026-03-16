@@ -296,7 +296,7 @@ static bool fetchBtc(double& outBtc) {
   String body = http.getString();
   http.end();
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, body)) return false;
 
   double v = doc["bitcoin"]["jpy"] | 0.0;
@@ -654,8 +654,8 @@ void setup(){
 
   // ENV III センサー初期化
   Wire.begin(21, 22);
-  gSht3x.begin(&Wire,   SHT3X_I2C_ADDR_44,        21, 22, 400000UL);
-  gQmp6988.begin(&Wire, QMP6988_SLAVE_ADDRESS_H,   21, 22, 400000UL);
+  gSht3x.begin(&Wire,   0x44, 21, 22, 400000UL);
+  gQmp6988.begin(&Wire, 0x70, 21, 22, 400000UL);
 
   // 初期値
   xSemaphoreTake(gMutex, portMAX_DELAY);
