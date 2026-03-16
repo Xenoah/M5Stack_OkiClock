@@ -4,6 +4,8 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <math.h>
+#include <M5UnitENV.h>
 
 #include "secrets.h"
 
@@ -13,9 +15,10 @@ static const uint32_t RSS_UPDATE_MS   = 60 * 1000; // 1分
 static const uint32_t WIFI_TIMEOUT_MS = 15 * 1000;
 static const uint32_t NTP_TIMEOUT_MS  = 8  * 1000;
 
-static const uint32_t TOP_UI_MS   = 250; // 上段更新
-static const uint32_t NEWS_TICK_MS= 33;  // ニューススクロール
+static const uint32_t TOP_UI_MS      = 250;  // 上段更新
+static const uint32_t NEWS_TICK_MS   = 33;   // ニューススクロール
 static const int      SCROLL_PX_PER_TICK = 2;
+static const uint32_t SENSOR_UPDATE_MS  = 2000; // センサー読み取り
 
 static const char* BTC_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=jpy";
 
@@ -38,6 +41,15 @@ static char     gWorld[RSS_BUF_SZ]    = "(pending)";
 static char     gBusiness[RSS_BUF_SZ] = "(pending)";
 static char     gTech[RSS_BUF_SZ]     = "(pending)";
 static uint32_t gRssRev  = 0;
+
+// センサーデータ
+static float    gTemp     = NAN;
+static float    gHumid    = NAN;
+static float    gPressure = NAN;
+static int      gPage     = 0; // 0=メイン, 1=センサー
+
+static SHT3X   gSht3x;
+static QMP6988 gQmp6988;
 
 // ===================== レイアウト（重なりゼロ） =====================
 static const int TOP_H   = 72;
@@ -431,6 +443,49 @@ static void drawNews4Lines() {
   }
 }
 
+// ===================== センサーページ =====================
+static void drawSensorPage() {
+  float temp, humid, pressure;
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  temp = gTemp; humid = gHumid; pressure = gPressure;
+  xSemaphoreGive(gMutex);
+
+  M5.Display.fillScreen(BLACK);
+
+  // ヘッダー
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(CYAN, BLACK);
+  M5.Display.setCursor(80, 5);
+  M5.Display.print("ENV III SENSOR");
+  M5.Display.drawFastHLine(0, 26, 320, 0x7BEF);
+
+  // 温度
+  M5.Display.setTextSize(3);
+  M5.Display.setTextColor(ORANGE, BLACK);
+  M5.Display.setCursor(10, 40);
+  if (!isnan(temp))   M5.Display.printf("Temp  %5.1f C", temp);
+  else                M5.Display.print ("Temp    --- C");
+
+  // 湿度
+  M5.Display.setTextColor(GREEN, BLACK);
+  M5.Display.setCursor(10, 100);
+  if (!isnan(humid))  M5.Display.printf("Humid %5.1f %%", humid);
+  else                M5.Display.print ("Humid   --- %%");
+
+  // 気圧
+  M5.Display.setTextColor(YELLOW, BLACK);
+  M5.Display.setCursor(10, 160);
+  if (!isnan(pressure)) M5.Display.printf("Pres %6.1f hPa", pressure);
+  else                  M5.Display.print ("Pres    --- hPa");
+
+  // フッター
+  M5.Display.drawFastHLine(0, 208, 320, 0x7BEF);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(0x7BEF, BLACK);
+  M5.Display.setCursor(70, 215);
+  M5.Display.print("[C] Clock/News");
+}
+
 // ===================== タスク =====================
 static void NetTask(void* arg){
   (void)arg;
@@ -517,21 +572,68 @@ static void UiTask(void* arg){
 
   drawStaticUI();
 
-  uint32_t lastTop = 0;
-  uint32_t lastNews= 0;
+  uint32_t lastTop        = 0;
+  uint32_t lastNews       = 0;
+  uint32_t lastSensor     = 0;
+  uint32_t lastSensorDraw = 0;
+  int      curPage        = -1; // 強制再描画トリガー
 
   for(;;){
     uint32_t now = millis();
 
-    if (now - lastTop >= TOP_UI_MS) {
-      drawTopDynamic();
-      lastTop = now;
+    // ボタンC: ページ切替
+    M5.update();
+    if (M5.BtnC.wasPressed()) {
+      xSemaphoreTake(gMutex, portMAX_DELAY);
+      gPage = 1 - gPage;
+      xSemaphoreGive(gMutex);
     }
 
-    if (now - lastNews >= NEWS_TICK_MS) {
-      rebuild4LinesIfNeeded();
-      drawNews4Lines();
-      lastNews = now;
+    // 現在ページ取得
+    int page;
+    xSemaphoreTake(gMutex, portMAX_DELAY);
+    page = gPage;
+    xSemaphoreGive(gMutex);
+
+    // ページ切替時に画面リセット
+    if (page != curPage) {
+      curPage = page;
+      if (page == 0) {
+        drawStaticUI();
+        lastTop = 0; lastNews = 0; // 即時更新
+      } else {
+        lastSensorDraw = 0; // 即時更新
+      }
+    }
+
+    if (page == 0) {
+      // ── メインページ ──
+      if (now - lastTop >= TOP_UI_MS) {
+        drawTopDynamic();
+        lastTop = now;
+      }
+      if (now - lastNews >= NEWS_TICK_MS) {
+        rebuild4LinesIfNeeded();
+        drawNews4Lines();
+        lastNews = now;
+      }
+    } else {
+      // ── センサーページ ──
+      // センサー読み取り
+      if (now - lastSensor >= SENSOR_UPDATE_MS) {
+        float t = NAN, h = NAN, p = NAN;
+        if (gSht3x.update())   { t = gSht3x.cTemp;  h = gSht3x.humidity; }
+        if (gQmp6988.update()) { p = gQmp6988.pressure / 100.0f; }
+        xSemaphoreTake(gMutex, portMAX_DELAY);
+        gTemp = t; gHumid = h; gPressure = p;
+        xSemaphoreGive(gMutex);
+        lastSensor = now;
+      }
+      // センサー描画（500ms毎）
+      if (now - lastSensorDraw >= 500) {
+        drawSensorPage();
+        lastSensorDraw = now;
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -549,6 +651,11 @@ void setup(){
   M5.Display.setTextColor(WHITE, BLACK);
 
   gMutex = xSemaphoreCreateMutex();
+
+  // ENV III センサー初期化
+  Wire.begin(21, 22);
+  gSht3x.begin(&Wire,   SHT3X_I2C_ADDR_44,        21, 22, 400000UL);
+  gQmp6988.begin(&Wire, QMP6988_SLAVE_ADDRESS_H,   21, 22, 400000UL);
 
   // 初期値
   xSemaphoreTake(gMutex, portMAX_DELAY);
