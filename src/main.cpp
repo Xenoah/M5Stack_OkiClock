@@ -15,10 +15,12 @@ static const uint32_t RSS_UPDATE_MS   = 60 * 1000; // 1分
 static const uint32_t WIFI_TIMEOUT_MS = 15 * 1000;
 static const uint32_t NTP_TIMEOUT_MS  = 8  * 1000;
 
-static const uint32_t TOP_UI_MS      = 250;  // 上段更新
-static const uint32_t NEWS_TICK_MS   = 33;   // ニューススクロール
+static const uint32_t TOP_UI_MS          = 250;  // 上段更新
+static const uint32_t NEWS_TICK_MS       = 33;   // ニューススクロール
 static const int      SCROLL_PX_PER_TICK = 2;
-static const uint32_t SENSOR_UPDATE_MS  = 2000; // センサー読み取り
+static const int      TICKER_PX_PER_TICK = 6;    // 通貨ティッカー（高速）
+static const uint32_t SENSOR_UPDATE_MS   = 2000; // センサー読み取り
+static const uint32_t RATES_UPDATE_MS    = 5 * 60 * 1000; // 為替レート（5分）
 
 static const char* BTC_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=jpy";
 
@@ -42,6 +44,9 @@ static char     gBusiness[RSS_BUF_SZ] = "(pending)";
 static char     gTech[RSS_BUF_SZ]     = "(pending)";
 static uint32_t gRssRev  = 0;
 
+static char     gTicker[512] = "(fetching rates...)";
+static uint32_t gTickerRev   = 0;
+
 // センサーデータ
 static float    gTemp     = NAN;
 static float    gHumid    = NAN;
@@ -52,9 +57,11 @@ static SHT3X   gSht3x;
 static QMP6988 gQmp6988;
 
 // ===================== レイアウト（重なりゼロ） =====================
-static const int TOP_H   = 72;
-static const int NEWS_Y  = TOP_H;
-static const int NEWS_H  = 240 - TOP_H;
+static const int TOP_H    = 72;
+static const int TICKER_H = 20;
+static const int TICKER_Y = TOP_H;           // = 72
+static const int NEWS_Y   = TOP_H + TICKER_H; // = 92
+static const int NEWS_H   = 240 - NEWS_Y;    // = 148 (4×37px)
 
 // カラーパレット（ダークネイビー系）
 static const uint16_t BG_TOP    = 0x0862; // 深い濃紺
@@ -343,9 +350,73 @@ static bool fetchBtc(double& outBtc) {
   return true;
 }
 
+// ===================== 為替レート =====================
+static bool fetchRates(char* dst, size_t dstsz) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setUserAgent("Mozilla/5.0 (M5Stack; ESP32) RatesClient/1.0");
+  if (!http.begin(client, "https://open.er-api.com/v6/latest/USD")) return false;
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+
+  // フィルターで必要な通貨だけ抽出
+  JsonDocument filter;
+  filter["rates"]["JPY"] = true;
+  filter["rates"]["EUR"] = true;
+  filter["rates"]["GBP"] = true;
+  filter["rates"]["CNY"] = true;
+  filter["rates"]["AUD"] = true;
+  filter["rates"]["CAD"] = true;
+  filter["rates"]["CHF"] = true;
+  filter["rates"]["HKD"] = true;
+  filter["rates"]["SGD"] = true;
+  filter["rates"]["KRW"] = true;
+  filter["rates"]["INR"] = true;
+  filter["rates"]["MXN"] = true;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(),
+                               DeserializationOption::Filter(filter));
+  http.end();
+  if (err) return false;
+
+  static const struct { const char* code; int dec; } PAIRS[] = {
+    {"JPY",1},{"EUR",4},{"GBP",4},{"CNY",4},{"AUD",4},
+    {"CAD",4},{"CHF",4},{"HKD",4},{"SGD",4},{"KRW",0},
+    {"INR",2},{"MXN",2},
+  };
+  static const int N = 12;
+
+  String s; s.reserve(dstsz - 1);
+  for (int i = 0; i < N; i++) {
+    double rate = doc["rates"][PAIRS[i].code] | 0.0;
+    if (rate <= 0.0) continue;
+    if (s.length()) s += "   ";
+    char buf[24];
+    if      (PAIRS[i].dec == 0) snprintf(buf, sizeof(buf), "%s %.0f",  PAIRS[i].code, rate);
+    else if (PAIRS[i].dec == 1) snprintf(buf, sizeof(buf), "%s %.1f",  PAIRS[i].code, rate);
+    else if (PAIRS[i].dec == 2) snprintf(buf, sizeof(buf), "%s %.2f",  PAIRS[i].code, rate);
+    else                        snprintf(buf, sizeof(buf), "%s %.4f",  PAIRS[i].code, rate);
+    s += buf;
+  }
+  if (s.length() == 0) return false;
+  snprintf(dst, dstsz, "%s", s.c_str());
+  return true;
+}
+
 // ===================== UI：スプライト =====================
-static M5Canvas topSpr (&M5.Display); // 320x72  上段用
-static M5Canvas newsSpr(&M5.Display); // 320x40  ニュース1段分
+static M5Canvas topSpr   (&M5.Display); // 320x72  上段用
+static M5Canvas tickerSpr(&M5.Display); // 320x20  通貨ティッカー
+static M5Canvas newsSpr  (&M5.Display); // 250x37  ニュース1段分
+
+// ティッカースクロール状態（UiTaskのみアクセス）
+static String   tickerText          = "";
+static int      tickerX             = 320;
+static int      tickerW             = 0;
+static uint32_t lastSeenTickerRev   = 0xFFFFFFFF;
 
 struct NewsLine {
   String text;
@@ -397,6 +468,41 @@ static void rebuild4LinesIfNeeded() {
   }
 }
 
+static void drawTicker() {
+  // データ更新チェック
+  uint32_t rev;
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  rev = gTickerRev;
+  xSemaphoreGive(gMutex);
+
+  if (rev != lastSeenTickerRev) {
+    lastSeenTickerRev = rev;
+    char buf[512];
+    xSemaphoreTake(gMutex, portMAX_DELAY);
+    snprintf(buf, sizeof(buf), "%s", gTicker);
+    xSemaphoreGive(gMutex);
+    tickerText = String(buf);
+    tickerSpr.setTextSize(2);
+    tickerW = tickerSpr.textWidth(tickerText.c_str());
+    if (tickerW < 1) tickerW = tickerText.length() * 12;
+    tickerX = 320;
+  }
+
+  tickerSpr.fillSprite(BG_PANEL);
+  // 上下の細ライン（ティッカー感）
+  tickerSpr.drawFastHLine(0, 0,           320, C_DIM);
+  tickerSpr.drawFastHLine(0, TICKER_H - 1, 320, C_DIM);
+  // スクロールテキスト
+  tickerSpr.setTextSize(2);
+  tickerSpr.setTextColor(C_ACCENT, BG_PANEL);
+  tickerSpr.setCursor(tickerX, 2);
+  tickerSpr.print(tickerText);
+  tickerSpr.pushSprite(0, TICKER_Y);
+
+  tickerX -= TICKER_PX_PER_TICK;
+  if (tickerX < -tickerW) tickerX = 320;
+}
+
 static void drawStaticUI() {
   M5.Display.fillScreen(BG_TOP);
 
@@ -411,13 +517,13 @@ static void drawStaticUI() {
   static const uint16_t BCOLS[] = {0x07FF, 0xFD20, 0xF81F, 0xFFFF}; // CYAN/ORANGE/MAGENTA/WHITE
 
   for (int i = 0; i < 4; i++) {
-    int y = NEWS_Y + i * 42;
-    M5.Display.fillRect(0, y, BADGE_W, 41, BG_PANEL);     // バッジ背景
-    M5.Display.fillRect(0, y, 5,       41, BCOLS[i]);      // 左カラーバー
-    M5.Display.drawFastVLine(BADGE_W, y, 41, C_DIM);       // 右境界線
+    int y = NEWS_Y + i * 37;
+    M5.Display.fillRect(0, y, BADGE_W, 36, BG_PANEL);     // バッジ背景
+    M5.Display.fillRect(0, y, 5,       36, BCOLS[i]);      // 左カラーバー
+    M5.Display.drawFastVLine(BADGE_W, y, 36, C_DIM);       // 右境界線
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(BCOLS[i], BG_PANEL);
-    M5.Display.setCursor(9, y + 13);
+    M5.Display.setCursor(9, y + 10);
     M5.Display.print(LABELS[i]);
   }
 }
@@ -492,7 +598,7 @@ static void drawTopDynamic() {
 }
 
 static void drawNews4Lines() {
-  const int lineH  = 42;
+  const int lineH  = 37;
   const int startY = NEWS_Y;
 
   newsSpr.setTextWrap(false);
@@ -604,8 +710,9 @@ static void NetTask(void* arg){
   uint32_t ntpStart  = 0;
   bool ntpStarted = false;
 
-  uint32_t lastBtc = 0;
-  uint32_t lastRss = 0;
+  uint32_t lastBtc   = 0;
+  uint32_t lastRss   = 0;
+  uint32_t lastRates = 0;
 
   for(;;){
     uint32_t now = millis();
@@ -667,6 +774,18 @@ static void NetTask(void* arg){
       lastRss = now;
     }
 
+    // 為替レート（5分ごと）
+    if (now - lastRates >= RATES_UPDATE_MS) {
+      char buf[512];
+      if (fetchRates(buf, sizeof(buf))) {
+        xSemaphoreTake(gMutex, portMAX_DELAY);
+        snprintf(gTicker, sizeof(gTicker), "%s", buf);
+        gTickerRev++;
+        xSemaphoreGive(gMutex);
+      }
+      lastRates = now;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
@@ -674,9 +793,10 @@ static void NetTask(void* arg){
 static void UiTask(void* arg){
   (void)arg;
 
-  // スプライト生成（上段: 320x72, ニュース: 250x42）
-  topSpr.createSprite(320, TOP_H);
-  newsSpr.createSprite(250, 42);
+  // スプライト生成
+  topSpr.createSprite(320, TOP_H);    // 320x72 上段
+  tickerSpr.createSprite(320, TICKER_H); // 320x20 通貨ティッカー
+  newsSpr.createSprite(250, 37);      // 250x37 ニュース1段
 
   drawStaticUI();
 
@@ -723,6 +843,7 @@ static void UiTask(void* arg){
       }
       if (now - lastNews >= NEWS_TICK_MS) {
         rebuild4LinesIfNeeded();
+        drawTicker();
         drawNews4Lines();
         lastNews = now;
       }
